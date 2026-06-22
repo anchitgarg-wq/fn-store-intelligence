@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: fn-store-intelligence
+    runtime: python
+    plan: standard           # FN data is smaller than SM, but keep 2GB for headroom/consistency
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app --timeout 600 --workers 1 --bind 0.0.0.0:$PORT"
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: REFRESH_TOKEN
+        sync: false          # set this secret in the Render dashboard
+      - key: PAYLOAD_DIR
+        value: /data
+    disk:
+      name: payload-disk
+      mountPath: /data
+      sizeGB: 1
