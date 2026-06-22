@@ -195,6 +195,27 @@ yd['Location']=yd['Location'].map(norm_store)
 yd = yd[yd['Location'].map(is_physical)].copy()
 yd['Key']=yd['Item Barcode'].map(b2k).fillna('BC-'+yd['Item Barcode'])
 yd = num(yd, ['Net Sales Amt','Net Sales Qty'])
+
+# ---- ORP-based yesterday FP% (units), per store: fallback for bad KPI FP% ----
+# The KPI file's Full Price Sales % occasionally has corrupt rows (e.g. 2699%, -900%).
+# As a fallback we derive FP% from the sales file itself: a sold unit is "full price" when
+# its actual unit price (Net Sales Amt / Qty) is within 5% of its Original Retail Price
+# (i.e. discount < 5%). FP% = full-price units / total units, per store. Yesterday only,
+# since the datewise sales file covers a single day.
+orp_fp_yest = {}   # location -> FP fraction (0-1) for yesterday, by units
+_ORP_COL = next((c for c in yd.columns if c.strip().lower() in
+                 ('original retail price','orp','original price','original retail')), None)
+if _ORP_COL:
+    _o = yd.copy()
+    _o['_orp'] = pd.to_numeric(_o[_ORP_COL], errors='coerce')
+    _o = _o[(_o['Net Sales Qty']>0) & (_o['_orp']>0)]
+    _o['_unit'] = _o['Net Sales Amt'] / _o['Net Sales Qty']
+    _o['_disc'] = 1.0 - (_o['_unit'] / _o['_orp'])
+    _o['_fpunits'] = (_o['_disc'] < 0.05) * _o['Net Sales Qty']   # full-price units (disc < 5%)
+    grp = _o.groupby('Location').agg(fpu=('_fpunits','sum'), tot=('Net Sales Qty','sum'))
+    orp_fp_yest = {loc: (r['fpu']/r['tot']) for loc, r in grp.iterrows() if r['tot']>0}
+    print(f'ORP-based yesterday FP% computed for {len(orp_fp_yest)} stores (fallback ready)')
+
 yd_key = yd.groupby(['Location','Key']).agg(YestAmt=('Net Sales Amt','sum'),
                                             YestQty=('Net Sales Qty','sum')).reset_index()
 
@@ -293,7 +314,7 @@ def _wcstatus(r,col):
 def item_row(r):
     """Full attributes for one Key at one store, for client-side ranking/filtering."""
     gm = gm_freshest(r)
-    fpmd = None if gm is None else ('FP' if gm>=70 else 'MD')
+    fpmd = None if gm is None else ('FP' if gm>=75 else 'MD')
     lr = r['LastRecv']
     recent = bool(pd.notna(lr) and lr.date()>recent_cutoff)
     name = key2name.get(r['Key']) or strip_size(r['Desc'], r['Key'])
@@ -506,7 +527,13 @@ try:
         convp = (txn/foot) if foot else None            # conversion% = total txns / total footfall
         upt   = (qty/txn) if txn else None              # UPT = total units / total transactions
         aov   = (sales/txn) if txn else None            # AOV = total sales / total transactions
-        fp    = (w['Full Price Sales %']*w['Net Sales Amt']).sum()/sales if sales else None  # rev-weighted
+        # FP% revenue-weighted from valid rows only. Corrupt KPI rows (e.g. 2699%, -900%)
+        # are excluded; if no valid rows remain, fp is None and the ORP fallback applies
+        # (yesterday) downstream.
+        _fpvalid = w[(w['Full Price Sales %']>=0) & (w['Full Price Sales %']<=1)]
+        _fpsales = _fpvalid['Net Sales Amt'].sum()
+        fp = ((_fpvalid['Full Price Sales %']*_fpvalid['Net Sales Amt']).sum()/_fpsales
+              if _fpsales else None)
         return {'sales':round2(sales),'qty':round2(qty),'footfall':round2(foot),
                 'conv':round2(convp*100 if convp is not None else None),
                 'fullprice':round2(fp*100 if fp is not None else None),
@@ -516,6 +543,14 @@ try:
         for p in ['yesterday','wtd','mtd','ytd']:
             s,e=win(p); ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
             ty=agg_window(sub,s,e); ly=agg_window(sub,ls,le)
+            # Fallback: if the KPI file gave no valid FP% for YESTERDAY, use the ORP-derived
+            # FP% (by units) computed from the sales file. Only yesterday can be recomputed
+            # (the datewise sales file is single-day); other periods keep None if invalid.
+            if p=='yesterday' and ty is not None and ty.get('fullprice') is None:
+                _orp = orp_fp_yest.get(loc)
+                if _orp is not None:
+                    ty['fullprice'] = round2(_orp*100)
+                    ty['fp_source'] = 'orp'
             per[p]={'ty':ty,'ly':ly}
         kpi_store[loc]=per
     print(f'KPI loaded for {len(kpi_store)} stores')
@@ -527,7 +562,16 @@ try:
         out={}
         for p in ['yesterday','wtd','mtd','ytd']:
             s,e=win(p); ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
-            out[p]={'ty':agg_window(csub,s,e),'ly':agg_window(csub,ls,le)}
+            ty=agg_window(csub,s,e); ly=agg_window(csub,ls,le)
+            # Combined ORP FP% fallback for yesterday: aggregate full-price units and total
+            # units across the member stores (units-weighted), not an average of percents.
+            if p=='yesterday' and ty is not None and ty.get('fullprice') is None and _ORP_COL:
+                _m = _o[_o['Location'].isin(locs)] if _ORP_COL else None
+                if _m is not None and len(_m):
+                    _fpu=_m['_fpunits'].sum(); _tot=_m['Net Sales Qty'].sum()
+                    if _tot>0:
+                        ty['fullprice']=round2(_fpu/_tot*100); ty['fp_source']='orp'
+            out[p]={'ty':ty,'ly':ly}
         return out
 except Exception as ex:
     print('KPI load skipped:', ex)
