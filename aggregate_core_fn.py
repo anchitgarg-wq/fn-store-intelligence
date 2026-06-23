@@ -48,6 +48,15 @@ def num(df, cols):
         df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
     return df
 
+# Store name normalisation (defined early so budget/LFL loaders can use it). Some stores
+# appear under more than one record; alias the secondary onto the single live store name.
+STORE_ALIASES = {
+    'FN DOHA FESTIVAL CITY 1': 'FN Doha Festival City',
+}
+def norm_store(loc):
+    if not isinstance(loc,str): return loc
+    return STORE_ALIASES.get(loc.upper().strip(), loc)
+
 # ---------------- barcode -> Color Code (FN's "key") ----------------
 # Forever New rolls up at COLOR CODE level (style-colour), the analogue of SM's NEW Key.
 key = pd.read_excel(U+'FN_Color_Code_Master.xlsx', dtype=str); key.columns=[c.strip() for c in key.columns]
@@ -78,6 +87,51 @@ def cat_for(code, fallback_group=None):
 def sub_for(code, fallback_dept=None):
     v = cc2sub.get(code)
     return v if (isinstance(v,str) and v.strip()) else (fallback_dept or 'Uncategorized')
+
+# Barcode -> FP/MD tag from the master. This authoritative tag (per the merchant) drives the
+# FP Sales metric: FP Sales % = FP-tagged sales amount / total sales amount, and the units
+# figure shown alongside = FP-tagged units / total units. Tag is consistent per color code.
+_fpmd_col = next((c for c in key.columns if c.strip().upper().replace(' ','') in ('FP/MD','FPMD')), None)
+bc2fpmd = {}
+if _fpmd_col:
+    _kf = key.dropna(subset=['Item Barcode']).copy()
+    _kf['_tag'] = _kf[_fpmd_col].astype(str).str.strip().str.upper()
+    _kf = _kf[_kf['_tag'].isin(['FP','MD'])]
+    bc2fpmd = _kf.drop_duplicates('Item Barcode').set_index('Item Barcode')['_tag'].to_dict()
+    print(f'FP/MD tags loaded from master: {len(bc2fpmd)} barcodes')
+
+# ---------------- Budget tab (store x date sales targets) ----------------
+# Budget achievement = actual sales / budget target, summed over the selected period.
+budget_by_loc_date = {}     # (normalised store name) -> {date: target}
+try:
+    bud = pd.read_excel(U+'FN_Color_Code_Master.xlsx', sheet_name='Budget')
+    bud.columns=[c.strip() for c in bud.columns]
+    bud['Date']=pd.to_datetime(bud['Date'],errors='coerce')
+    bud['Sales Target']=pd.to_numeric(bud['Sales Target'],errors='coerce')
+    _nm_col = 'Loc Name' if 'Loc Name' in bud.columns else ('Location' if 'Location' in bud.columns else bud.columns[1])
+    bud['_loc']=bud[_nm_col].map(norm_store)   # align to merged/live store names
+    for (loc,dte), grp in bud.dropna(subset=['Date']).groupby(['_loc', bud['Date'].dt.date]):
+        budget_by_loc_date.setdefault(loc, {})[dte] = grp['Sales Target'].sum()
+    print(f'Budget loaded: {len(budget_by_loc_date)} stores')
+except Exception as ex:
+    print('Budget tab not loaded:', ex)
+
+# ---------------- LFL Dates tab (store opening dates) ----------------
+# Like-for-like: a store is "comparable" for a period only if it was open for the ENTIRE
+# corresponding period one year earlier (open on/before the LY window start). Used by the
+# LFL toggle to restrict combined totals to comparable stores.
+store_open = {}   # normalised store name -> opening date (date)
+try:
+    lfl = pd.read_excel(U+'FN_Color_Code_Master.xlsx', sheet_name='LFL Dates')
+    lfl.columns=[c.strip() for c in lfl.columns]
+    _sn = next((c for c in lfl.columns if 'store' in c.lower() and 'name' in c.lower()), lfl.columns[1])
+    _od = next((c for c in lfl.columns if 'opening' in c.lower() or 'open' in c.lower()), None)
+    lfl['_open']=pd.to_datetime(lfl[_od],errors='coerce')
+    for _,r in lfl.dropna(subset=['_open']).iterrows():
+        store_open[norm_store(str(r[_sn]).strip())] = r['_open'].date()
+    print(f'LFL opening dates loaded: {len(store_open)} stores')
+except Exception as ex:
+    print('LFL Dates tab not loaded:', ex)
 
 # ---------------- image lookup (FN: color code -> Image Link) ----------------
 key2img = {}
@@ -171,16 +225,6 @@ def is_physical(loc):
     if 'DEBENHAM' in u: return False   # FN concessions inside Debenhams (no standalone KPI/footfall)
     return True
 
-# Some stores appear under more than one record (e.g. a relocation or a duplicate POS entry).
-# Alias the secondary record onto the single live store name so inventory, sales AND KPI all
-# roll up together. 'FN Doha Festival City 1' is a secondary record for 'FN Doha Festival City'
-# (the live store); its KPI rows fill the gaps on the live store.
-STORE_ALIASES = {
-    'FN DOHA FESTIVAL CITY 1': 'FN Doha Festival City',
-}
-def norm_store(loc):
-    if not isinstance(loc,str): return loc
-    return STORE_ALIASES.get(loc.upper().strip(), loc)
 inv['Location'] = inv['Location'].map(norm_store)
 inv = inv[inv['Location'].map(is_physical)].copy()
 # Scope to core merchandise. FN is apparel: exclude only NON MERCHANDISE and SHOPPING BAGS
@@ -207,25 +251,56 @@ yd = yd[yd['Location'].map(is_physical)].copy()
 yd['Key']=yd['Item Barcode'].map(b2k).fillna('BC-'+yd['Item Barcode'])
 yd = num(yd, ['Net Sales Amt','Net Sales Qty'])
 
-# ---- ORP-based yesterday FP% (units), per store: fallback for bad KPI FP% ----
-# The KPI file's Full Price Sales % occasionally has corrupt rows (e.g. 2699%, -900%).
-# As a fallback we derive FP% from the sales file itself: a sold unit is "full price" when
-# its actual unit price (Net Sales Amt / Qty) is within 5% of its Original Retail Price
-# (i.e. discount < 5%). FP% = full-price units / total units, per store. Yesterday only,
-# since the datewise sales file covers a single day.
-orp_fp_yest = {}   # location -> FP fraction (0-1) for yesterday, by units
-_ORP_COL = next((c for c in yd.columns if c.strip().lower() in
-                 ('original retail price','orp','original price','original retail')), None)
-if _ORP_COL:
-    _o = yd.copy()
-    _o['_orp'] = pd.to_numeric(_o[_ORP_COL], errors='coerce')
-    _o = _o[(_o['Net Sales Qty']>0) & (_o['_orp']>0)]
-    _o['_unit'] = _o['Net Sales Amt'] / _o['Net Sales Qty']
-    _o['_disc'] = 1.0 - (_o['_unit'] / _o['_orp'])
-    _o['_fpunits'] = (_o['_disc'] < 0.05) * _o['Net Sales Qty']   # full-price units (disc < 5%)
-    grp = _o.groupby('Location').agg(fpu=('_fpunits','sum'), tot=('Net Sales Qty','sum'))
-    orp_fp_yest = {loc: (r['fpu']/r['tot']) for loc, r in grp.iterrows() if r['tot']>0}
-    print(f'ORP-based yesterday FP% computed for {len(orp_fp_yest)} stores (fallback ready)')
+# ---- Tag-based yesterday FP metrics, per store (from master FP/MD tag) ----
+# Authoritative FP/MD comes from the master. For each store's yesterday sales:
+#   FP Sales %  = FP-tagged sales amount / total sales amount   (by AMOUNT)
+#   FP units %  = FP-tagged units / total units                (shown alongside)
+# Computed from the datewise sales file (single day = yesterday). Other periods fall back
+# to the KPI file's FP% (which has no unit count).
+fp_yest = {}   # location -> {'amt_pct':0-1, 'unit_pct':0-1, 'fp_units':int, 'tot_units':int}
+_yt = yd.copy()
+_yt['_tag'] = _yt['Item Barcode'].map(bc2fpmd)            # FP / MD / None
+_yt['_isfp'] = (_yt['_tag']=='FP')
+_yt['_fp_amt']  = _yt['_isfp'] * _yt['Net Sales Amt']
+_yt['_fp_qty']  = _yt['_isfp'] * _yt['Net Sales Qty']
+_g = _yt.groupby('Location').agg(fp_amt=('_fp_amt','sum'), tot_amt=('Net Sales Amt','sum'),
+                                 fp_qty=('_fp_qty','sum'), tot_qty=('Net Sales Qty','sum'))
+for loc, r in _g.iterrows():
+    _amt_pct = (r['fp_amt']/r['tot_amt']) if r['tot_amt'] else None
+    _unit_pct = (r['fp_qty']/r['tot_qty']) if r['tot_qty'] else None
+    # Returns can shrink total net amount to near-zero/negative, making the amount-based %
+    # explode (e.g. 2699%). When the amount% is implausible (outside 0-1) or the denominator
+    # is non-positive, fall back to the robust unit-based % for display.
+    if _amt_pct is None or not (0 <= _amt_pct <= 1):
+        _amt_pct = _unit_pct
+    fp_yest[loc] = {
+        'amt_pct':  _amt_pct,
+        'unit_pct': _unit_pct,
+        'fp_units': int(round(r['fp_qty'])), 'tot_units': int(round(r['tot_qty'])),
+    }
+print(f'Tag-based yesterday FP metrics computed for {len(fp_yest)} stores')
+
+# ---- GP% per store per period: 1 - (cost/sales) ----
+# Yesterday cost/sales come from the datewise sales file; WTD/MTD/YTD from the inventory
+# file's period cost & sales columns. Stored as gp_store[loc][period] = gp fraction (0-1).
+gp_store = {}
+def _gp(cost, sales):
+    return (1 - cost/sales) if (sales and sales!=0) else None
+# yesterday from yd (sales file) - needs Cost Amt
+if 'Cost Amt' in yd.columns:
+    yd = num(yd, ['Cost Amt'])
+    _yg = yd.groupby('Location').agg(c=('Cost Amt','sum'), s=('Net Sales Amt','sum'))
+    for loc, r in _yg.iterrows():
+        gp_store.setdefault(loc, {})['yesterday'] = _gp(r['c'], r['s'])
+# WTD/MTD/YTD from inventory period columns
+_invp = inv.groupby('Location').agg(
+    cW=('Cost Amt (WTD)','sum'), sW=('Net Sales Amt (WTD)','sum'),
+    cM=('Cost Amt (MTD)','sum'), sM=('Net Sales Amt (MTD)','sum'),
+    cY=('Cost Amt (YTD)','sum'), sY=('Net Sales Amt (YTD)','sum'))
+for loc, r in _invp.iterrows():
+    d = gp_store.setdefault(loc, {})
+    d['wtd']=_gp(r['cW'],r['sW']); d['mtd']=_gp(r['cM'],r['sM']); d['ytd']=_gp(r['cY'],r['sY'])
+print(f'GP% computed for {len(gp_store)} stores')
 
 yd_key = yd.groupby(['Location','Key']).agg(YestAmt=('Net Sales Amt','sum'),
                                             YestQty=('Net Sales Qty','sum')).reset_index()
@@ -534,6 +609,17 @@ try:
         if period=='wtd': return KPI_ASOF - dt.timedelta(days=KPI_ASOF.weekday()), KPI_ASOF
         if period=='mtd': return KPI_ASOF.replace(day=1), KPI_ASOF
         return KPI_ASOF.replace(month=1, day=1), KPI_ASOF
+    def sum_budget(locs, s, e):
+        """Sum daily Sales Target between s and e (inclusive) for a store or list of stores."""
+        if isinstance(locs, str): locs=[locs]
+        tot=0.0; found=False
+        for loc in locs:
+            bd=budget_by_loc_date.get(loc)
+            if not bd: continue
+            for dte,val in bd.items():
+                if s<=dte<=e and val==val:
+                    tot+=val; found=True
+        return tot if found else None
     def agg_window(sub, s, e):
         m = (sub['Date'].dt.date>=s) & (sub['Date'].dt.date<=e)
         w = sub[m]
@@ -561,39 +647,84 @@ try:
         for p in ['yesterday','wtd','mtd','ytd']:
             s,e=win(p); ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
             ty=agg_window(sub,s,e); ly=agg_window(sub,ls,le)
-            # Fallback: if the KPI file gave no valid FP% for YESTERDAY, use the ORP-derived
-            # FP% (by units) computed from the sales file. Only yesterday can be recomputed
-            # (the datewise sales file is single-day); other periods keep None if invalid.
-            if p=='yesterday' and ty is not None and ty.get('fullprice') is None:
-                _orp = orp_fp_yest.get(loc)
-                if _orp is not None:
-                    ty['fullprice'] = round2(_orp*100)
-                    ty['fp_source'] = 'orp'
+            # YESTERDAY FP from the authoritative master FP/MD tag (computed from the sales
+            # file): FP Sales % = FP-tagged amount / total amount; plus FP unit % and counts
+            # shown alongside. This overrides the KPI file's FP% for yesterday. Other periods
+            # keep the KPI file's FP% (no per-unit tag history available there).
+            if p=='yesterday' and ty is not None:
+                _f = fp_yest.get(loc)
+                if _f and _f.get('amt_pct') is not None:
+                    ty['fullprice']   = round2(_f['amt_pct']*100)    # by amount
+                    ty['fp_unit_pct'] = round2(_f['unit_pct']*100)   # by units
+                    ty['fp_units']    = _f['fp_units']
+                    ty['tot_units']   = _f['tot_units']
+                    ty['fp_source']   = 'tag'
+            # GP% (1 - cost/sales) for this store/period
+            if ty is not None:
+                _g = gp_store.get(loc, {}).get(p)
+                ty['gp'] = round2(_g*100 if _g is not None else None)
+            # Budget achievement: actual sales / sum of daily targets over the period window
+            if ty is not None:
+                _bt = sum_budget(loc, s, e)
+                ty['budget'] = round2(_bt) if _bt else None
+                ty['budget_pct'] = round2(ty['sales']/_bt*100) if (_bt and ty.get('sales') is not None) else None
             per[p]={'ty':ty,'ly':ly}
         kpi_store[loc]=per
     print(f'KPI loaded for {len(kpi_store)} stores')
 
-    def combine_kpis(locs):
-        """Sum KPIs across a list of store locations, per period, TY and LY."""
-        csub = kdf[kdf['Location'].isin(locs)]
-        if csub.empty: return None
+    def _gp_combined(locs, salescol, costcol):
+        sub=inv[inv['Location'].isin(locs)]
+        s=pd.to_numeric(sub[salescol],errors='coerce').sum(); c=pd.to_numeric(sub[costcol],errors='coerce').sum()
+        return (1-c/s) if s else None
+    def combine_kpis(locs, lfl=False):
+        """Sum KPIs across store locations, per period, TY and LY.
+        When lfl=True, restrict to stores open for the full LY window (comparable stores),
+        so TY-vs-LY is like-for-like."""
         out={}
         for p in ['yesterday','wtd','mtd','ytd']:
             s,e=win(p); ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
+            mem = locs
+            if lfl:
+                # comparable = opened on/before the LY window start (open across both periods)
+                mem = [l for l in locs if (store_open.get(l) is not None and store_open[l] <= ls)]
+            csub = kdf[kdf['Location'].isin(mem)]
+            if csub.empty:
+                out[p]={'ty':None,'ly':None,'lfl_stores':len(mem) if lfl else None}; continue
             ty=agg_window(csub,s,e); ly=agg_window(csub,ls,le)
-            # Combined ORP FP% fallback for yesterday: aggregate full-price units and total
-            # units across the member stores (units-weighted), not an average of percents.
-            if p=='yesterday' and ty is not None and ty.get('fullprice') is None and _ORP_COL:
-                _m = _o[_o['Location'].isin(locs)] if _ORP_COL else None
-                if _m is not None and len(_m):
-                    _fpu=_m['_fpunits'].sum(); _tot=_m['Net Sales Qty'].sum()
-                    if _tot>0:
-                        ty['fullprice']=round2(_fpu/_tot*100); ty['fp_source']='orp'
-            out[p]={'ty':ty,'ly':ly}
+            if p=='yesterday' and ty is not None:
+                _m = _yt[_yt['Location'].isin(mem)]
+                if len(_m):
+                    _fpa=_m['_fp_amt'].sum(); _ta=_m['Net Sales Amt'].sum()
+                    _fpq=_m['_fp_qty'].sum(); _tq=_m['Net Sales Qty'].sum()
+                    _apct=(_fpa/_ta) if _ta else None; _upct=(_fpq/_tq) if _tq else None
+                    if _apct is None or not (0<=_apct<=1): _apct=_upct
+                    if _apct is not None:
+                        ty['fullprice']=round2(_apct*100); ty['fp_unit_pct']=round2(_upct*100 if _upct is not None else None)
+                        ty['fp_units']=int(round(_fpq)); ty['tot_units']=int(round(_tq)); ty['fp_source']='tag'
+            # GP% combined
+            if ty is not None:
+                if p=='yesterday':
+                    _ys=_yt[_yt['Location'].isin(mem)] if len(_yt) else None
+                    if _ys is not None and 'Cost Amt' in yd.columns:
+                        _yc=yd[yd['Location'].isin(mem)]
+                        c=pd.to_numeric(_yc['Cost Amt'],errors='coerce').sum(); sa=pd.to_numeric(_yc['Net Sales Amt'],errors='coerce').sum()
+                        ty['gp']=round2((1-c/sa)*100) if sa else None
+                else:
+                    colmap={'wtd':('Net Sales Amt (WTD)','Cost Amt (WTD)'),
+                            'mtd':('Net Sales Amt (MTD)','Cost Amt (MTD)'),
+                            'ytd':('Net Sales Amt (YTD)','Cost Amt (YTD)')}
+                    sc,cc=colmap[p]; _gpv=_gp_combined(mem,sc,cc)
+                    ty['gp']=round2(_gpv*100 if _gpv is not None else None)
+                # Budget combined
+                _bt=sum_budget(mem,s,e)
+                ty['budget']=round2(_bt) if _bt else None
+                ty['budget_pct']=round2(ty['sales']/_bt*100) if (_bt and ty.get('sales') is not None) else None
+            blob_extra={'lfl_stores':len(mem)} if lfl else {}
+            out[p]={'ty':ty,'ly':ly, **blob_extra}
         return out
 except Exception as ex:
     print('KPI load skipped:', ex)
-    def combine_kpis(locs): return None
+    def combine_kpis(locs, lfl=False): return None
 
 # ---------------- top-10 in-transit ITEMS with images ----------------
 inv['ImgKey']=inv['Key']
@@ -659,7 +790,39 @@ for country, csub in g.groupby('Country'):
     if kpi_store:
         clocs=[l for l in csub['Location'].unique() if l in kpi_store]
         blob['kpi']=combine_kpis(clocs)
+        blob['kpi_lfl']=combine_kpis(clocs, lfl=True)   # like-for-like (comparable stores only)
     country_blobs[country]=blob
+
+# ---------------- ALL COUNTRIES (consolidated GCC) blob ----------------
+# Grand total across every physical store, for the default "All Countries" view.
+_alllocs = sorted(g['Location'].unique().tolist())
+_allinv = inv
+all_blob = {'country':'All Countries','region':'All regions','is_combined':True,'is_allcountries':True,
+            'cat_pivot':cat_pivot(g),
+            'in_transit':in_transit(_allinv),
+            'transit_items':transit_items_df(_allinv),
+            'kpi':None}
+acg = g.groupby('Key').agg(
+    Desc=('Desc','first'),Group=('Group','first'),Dept=('Dept','first'),Cls=('Cls','first'),
+    Season=('Season','first'), LastRecv=('LastRecv','max'),
+    YestAmt=('YestAmt','sum'),YestQty=('YestQty','sum'),
+    WTDamt=('WTDamt','sum'),WTDqty=('WTDqty','sum'),WTDcost=('WTDcost','sum'),
+    MTDamt=('MTDamt','sum'),MTDqty=('MTDqty','sum'),MTDcost=('MTDcost','sum'),
+    YTDamt=('YTDamt','sum'),YTDqty=('YTDqty','sum'),YTDcost=('YTDcost','sum'),
+    InvQty=('InvQty','sum'),StockCost=('StockCost','sum'),Image=('Image','first'),
+).reset_index()
+rwk=np.where(acg['WTDqty']>0,(acg['WTDqty']/DAYS_ELAPSED)*7,np.nan)
+rmo=np.where(acg['MTDqty']>0,(acg['MTDqty']/DAYS_IN_MONTH)*7,np.nan)
+ryr=np.where(acg['YTDqty']>0,(acg['YTDqty']/DAYS_IN_YEAR)*7,np.nan)
+acg['WC_week']=np.where(np.isfinite(rwk),acg['InvQty']/rwk,np.where(np.isfinite(rmo),acg['InvQty']/rmo,np.where(np.isfinite(ryr),acg['InvQty']/ryr,np.nan)))
+acg['WC_month']=np.where(np.isfinite(rmo),acg['InvQty']/rmo,np.where(np.isfinite(ryr),acg['InvQty']/ryr,np.nan))
+acg['WC_year']=np.where(np.isfinite(ryr),acg['InvQty']/ryr,np.nan)
+all_blob['items']=candidate_items(acg[(acg['InvQty']>0)|(acg['YTDqty']>0)|(acg['YestQty']>0)])
+if kpi_store:
+    alllocs=[l for l in _alllocs if l in kpi_store]
+    all_blob['kpi']=combine_kpis(alllocs)
+    all_blob['kpi_lfl']=combine_kpis(alllocs, lfl=True)
+country_blobs['All Countries']=all_blob
 
 # ---------------- country revenue ranking (MTD) ----------------
 crev = inv.groupby('Country')['Net Sales Amt (MTD)'].sum().sort_values(ascending=False)
