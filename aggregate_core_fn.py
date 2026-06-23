@@ -682,19 +682,34 @@ try:
                 ty['budget_pct'] = round2(ty['sales']/_bt*100) if (_bt and ty.get('sales') is not None) else None
             per[p]={'ty':ty,'ly':ly}
         kpi_store[loc]=per
-        # Store-level like-for-like: same TY figures, but the LY comparison is only kept
-        # when this store was open on/before the LY window start (i.e. it actually traded in
-        # the comparison period). Otherwise LY is suppressed so the dashboard doesn't show a
-        # misleading vs-LY delta for a store that didn't exist last year.
+        # Store-level like-for-like. A naive LY comparison is unfair for a store that opened
+        # part-way through last year's window (TY spans the full period; LY only from the open
+        # date). True LFL clips BOTH years to the window where the store actually traded in
+        # last year too: from max(period start, opening anniversary-agnostic open date) .. period end.
+        # i.e. LY window = [max(LYstart, open) .. LYend]; TY window = the SAME calendar span
+        # shifted forward one year, so the two spans are equal length and directly comparable.
         per_lfl={}
         _open=store_open.get(loc)
         for p in ['yesterday','wtd','mtd','ytd']:
             s,e=win(p); ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
-            base=per.get(p,{}) or {}
-            comparable = (_open is not None and _open <= ls)
-            per_lfl[p]={'ty':base.get('ty'),
-                        'ly':(base.get('ly') if comparable else None),
-                        'comparable':bool(comparable)}
+            if _open is None:
+                # no opening date on record -> behave like the standard comparison
+                per_lfl[p]={'ty':per.get(p,{}).get('ty'),'ly':per.get(p,{}).get('ly'),'comparable':True}
+                continue
+            if _open > le:
+                # store didn't exist at all during last year's window -> no LY comparison
+                per_lfl[p]={'ty':per.get(p,{}).get('ty'),'ly':None,'comparable':False}
+                continue
+            # clip LY window to when the store was open; mirror the same span in TY
+            ly_s = max(ls, _open)
+            ly_e = le
+            # equal-length TY span ending at the period end (shift the clipped LY span +1yr)
+            ty_s = ly_s.replace(year=ly_s.year+1)
+            ty_e = e
+            ty_l = agg_window(sub, ty_s, ty_e)
+            ly_l = agg_window(sub, ly_s, ly_e)
+            per_lfl[p]={'ty':ty_l,'ly':ly_l,'comparable':True,
+                        'lfl_window':{'ty':[str(ty_s),str(ty_e)],'ly':[str(ly_s),str(ly_e)]}}
         kpi_lfl_store[loc]=per_lfl
     print(f'KPI loaded for {len(kpi_store)} stores')
 
