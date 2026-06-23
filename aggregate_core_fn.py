@@ -204,6 +204,11 @@ for _c in ['Cost Amt (WTD)','Cost Amt (MTD)','Cost Amt (YTD)']:
     if _c not in inv.columns: inv[_c] = pd.NA
 inv['Item Barcode']=inv['Item Barcode'].str.strip()
 inv['Key']=inv['Item Barcode'].map(b2k).fillna('BC-'+inv['Item Barcode'])
+# Master-driven Category / Sub category (keyed by color code = Key), with the coarse
+# inventory Item Group / Item Department as fallback. Used for stock-in-transit grouping
+# so it matches the category taxonomy shown elsewhere on the dashboard.
+inv['Cat'] = [cat_for(k, g) for k, g in zip(inv['Key'], inv['Item Group'])]
+inv['Sub'] = [sub_for(k, d) for k, d in zip(inv['Key'], inv['Item Department'])]
 # Last-received date drives the "exclude last-30-day arrivals" rule on bottom sellers.
 # If the date column is absent, fall back to Ageing Days (>30 days => not a new arrival).
 if 'Last recieved date store' in inv.columns:
@@ -554,17 +559,18 @@ def cat_pivot(df):
     tree.sort(key=lambda x:-(x['rev'] or 0))
     return tree
 
-# ---------------- in-transit by group/dept ----------------
+# ---------------- in-transit by category/sub category (from master) ----------------
 def in_transit(df):
-    it = df.groupby(['Item Group','Item Department'])['In Transit Qty'].sum().reset_index()
+    it = df.groupby(['Cat','Sub'])['In Transit Qty'].sum().reset_index()
     it = it[it['In Transit Qty']>0].sort_values('In Transit Qty',ascending=False)
-    return [{'group':r['Item Group'],'dept':r['Item Department'],'qty':round2(r['In Transit Qty'])}
+    return [{'group':r['Cat'],'dept':r['Sub'],'qty':round2(r['In Transit Qty'])}
             for _,r in it.iterrows()]
 
 # ---------------- per-store summary ----------------
 # KPI source (daily, dated) — footfall/conversion/qty/full-price/UPT with LY comparison
 KPI_FILE = U+'04__Store_KPI__For_Live_Dashboard_-_Anchit_.xlsx'
 kpi_store = {}
+kpi_lfl_store = {}
 try:
     kdf = pd.read_excel(KPI_FILE, header=0)
     kdf.columns=[c.strip() for c in kdf.columns]
@@ -670,6 +676,20 @@ try:
                 ty['budget_pct'] = round2(ty['sales']/_bt*100) if (_bt and ty.get('sales') is not None) else None
             per[p]={'ty':ty,'ly':ly}
         kpi_store[loc]=per
+        # Store-level like-for-like: same TY figures, but the LY comparison is only kept
+        # when this store was open on/before the LY window start (i.e. it actually traded in
+        # the comparison period). Otherwise LY is suppressed so the dashboard doesn't show a
+        # misleading vs-LY delta for a store that didn't exist last year.
+        per_lfl={}
+        _open=store_open.get(loc)
+        for p in ['yesterday','wtd','mtd','ytd']:
+            s,e=win(p); ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
+            base=per.get(p,{}) or {}
+            comparable = (_open is not None and _open <= ls)
+            per_lfl[p]={'ty':base.get('ty'),
+                        'ly':(base.get('ly') if comparable else None),
+                        'comparable':bool(comparable)}
+        kpi_lfl_store[loc]=per_lfl
     print(f'KPI loaded for {len(kpi_store)} stores')
 
     def _gp_combined(locs, salescol, costcol):
@@ -733,8 +753,8 @@ def transit_items_df(sub):
     sub=sub[sub['In Transit Qty']>0]
     if sub.empty: return []
     g2=sub.groupby('Key').agg(qty=('In Transit Qty','sum'),
-            desc=('Item Description','first'),grp=('Item Group','first'),
-            dept=('Item Department','first')).reset_index()
+            desc=('Item Description','first'),grp=('Cat','first'),
+            dept=('Sub','first')).reset_index()
     g2=g2.sort_values('qty',ascending=False).head(TOP_N)
     out=[]
     for _,r in g2.iterrows():
@@ -755,7 +775,8 @@ for loc, sub in g.groupby('Location'):
           'cat_pivot':cat_pivot(sub),
           'in_transit':in_transit(inv_sub),
           'transit_items':transit_items(loc),
-          'kpi':kpi_store.get(loc)}
+          'kpi':kpi_store.get(loc),
+          'kpi_lfl':kpi_lfl_store.get(loc)}
     stores[loc]=blob
 
 # ---------------- COUNTRY-COMBINED ("All Stores") blobs ----------------
