@@ -358,18 +358,31 @@ g[['YestAmt','YestQty']] = g[['YestAmt','YestQty']].fillna(0)
 
 # ---- per-period weeks-cover with cascade (selected period -> next -> next) ----
 # weekly rate from a period: (qty / days_elapsed_in_period) * 7
+# Guard: a period whose elapsed window is too short produces an unstable, inflated run-rate
+# (e.g. on Monday the WTD window is 1 day, so (qty/1)*7 overstates the weekly rate ~7x and
+# makes cover read far too low). When the current period hasn't accumulated enough days, fall
+# through to the next-longer period's rate, which is more representative.
+MIN_WK_DAYS = 4   # need >=4 days in the week before trusting the WTD rate
+MIN_MO_DAYS = 7   # need >=7 days in the month before trusting the MTD rate
 rate_wtd = np.where(g['WTDqty'] > 0, (g['WTDqty'] / DAYS_ELAPSED) * 7, np.nan)
 rate_mtd = np.where(g['MTDqty'] > 0, (g['MTDqty'] / DAYS_IN_MONTH) * 7, np.nan)
 rate_ytd = np.where(g['YTDqty'] > 0, (g['YTDqty'] / DAYS_IN_YEAR) * 7, np.nan)
+# If too few days have elapsed in a period, treat its rate as unavailable so the cascade
+# uses the longer, more stable window instead.
+wtd_ok = DAYS_ELAPSED >= MIN_WK_DAYS
+mtd_ok = DAYS_IN_MONTH >= MIN_MO_DAYS
 
 def cover_from_rate(rate):
     return np.where((rate > 0) & np.isfinite(rate), g['InvQty'] / rate, np.nan)
 
 # cascade order per selected period:
 #   wtd/yesterday: WTD -> MTD -> YTD ; mtd: MTD -> YTD ; ytd: YTD
-casc_week  = np.where(np.isfinite(rate_wtd), rate_wtd,
-              np.where(np.isfinite(rate_mtd), rate_mtd, rate_ytd))
-casc_month = np.where(np.isfinite(rate_mtd), rate_mtd, rate_ytd)
+# but skip a period's rate when its window is too short to be reliable.
+_wtd = rate_wtd if wtd_ok else np.full(len(g), np.nan)
+_mtd = rate_mtd if mtd_ok else np.full(len(g), np.nan)
+casc_week  = np.where(np.isfinite(_wtd), _wtd,
+              np.where(np.isfinite(_mtd), _mtd, rate_ytd))
+casc_month = np.where(np.isfinite(_mtd), _mtd, rate_ytd)
 casc_year  = rate_ytd
 
 g['WC_week']  = cover_from_rate(casc_week)   # yesterday + wtd views
@@ -719,21 +732,71 @@ try:
         return (1-c/s) if s else None
     def combine_kpis(locs, lfl=False):
         """Sum KPIs across store locations, per period, TY and LY.
-        When lfl=True, restrict to stores open for the full LY window (comparable stores),
-        so TY-vs-LY is like-for-like."""
+        When lfl=True, restrict to like-for-like: a store counts if it traded during last
+        year's window at all (opened on/before the LY window end). For each such store the
+        TY and LY windows are clipped to the span where it traded in BOTH years, then summed
+        across the comparable cohort — so partially-open stores still contribute their
+        comparable portion rather than being dropped entirely."""
         out={}
         for p in ['yesterday','wtd','mtd','ytd']:
             s,e=win(p); ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
-            mem = locs
-            if lfl:
-                # comparable = opened on/before the LY window start (open across both periods)
-                mem = [l for l in locs if (store_open.get(l) is not None and store_open[l] <= ls)]
-            csub = kdf[kdf['Location'].isin(mem)]
-            if csub.empty:
-                out[p]={'ty':None,'ly':None,'lfl_stores':len(mem) if lfl else None}; continue
-            ty=agg_window(csub,s,e); ly=agg_window(csub,ls,le)
-            if p=='yesterday' and ty is not None:
-                _m = _yt[_yt['Location'].isin(mem)]
+            if not lfl:
+                csub = kdf[kdf['Location'].isin(locs)]
+                if csub.empty:
+                    out[p]={'ty':None,'ly':None}; continue
+                ty=agg_window(csub,s,e); ly=agg_window(csub,ls,le)
+            else:
+                # comparable cohort = stores open on/before the LY window END (traded last year)
+                mem=[l for l in locs if (store_open.get(l) is not None and store_open[l] <= le)]
+                if not mem:
+                    out[p]={'ty':None,'ly':None,'lfl_stores':0}; continue
+                # sum per-store, each clipped to its own comparable window
+                def _sum_clipped(year_offset):
+                    parts=[]
+                    for l in mem:
+                        op=store_open[l]
+                        ly_s=max(ls,op); ly_e=le
+                        if year_offset==0:           # last year window (clipped to open)
+                            ws,we=ly_s,ly_e
+                        else:                        # this year: same span shifted +1yr
+                            ws,we=ly_s.replace(year=ly_s.year+1), e
+                        sub_l=kdf[kdf['Location']==l]
+                        a=agg_window(sub_l,ws,we)
+                        if a is not None: parts.append(a)
+                    return parts
+                def _agg_parts(parts):
+                    if not parts: return None
+                    sales=sum(x['sales'] for x in parts); qty=sum(x['qty'] for x in parts)
+                    foot=sum(x['footfall'] for x in parts)
+                    # rebuild ratio KPIs from summed components where possible
+                    conv=None; upt=None; aov=None
+                    return {'sales':round2(sales),'qty':round2(qty),'footfall':round2(foot),
+                            'conv':None,'fullprice':None,'gp':None,'upt':None,'aov':None}
+                ty=_agg_parts(_sum_clipped(1)); ly=_agg_parts(_sum_clipped(0))
+                # recompute GP, conv, upt, aov for the clipped cohort from raw rows
+                def _ratios(parts_year):
+                    rows=[]
+                    for l in mem:
+                        op=store_open[l]; ly_s=max(ls,op)
+                        if parts_year==1: ws,we=ly_s.replace(year=ly_s.year+1), e
+                        else: ws,we=ly_s, le
+                        sub_l=kdf[(kdf['Location']==l)&(kdf['Date'].dt.date>=ws)&(kdf['Date'].dt.date<=we)]
+                        if len(sub_l): rows.append(sub_l)
+                    if not rows: return
+                    w=pd.concat(rows)
+                    sales=w['Net Sales Amt'].sum(); qty=w['Net Sales Qty'].sum(); foot=w['Footfall'].sum()
+                    txn=(w['Footfall']*w['Footfall Conversion %']).sum()
+                    tgt = ty if parts_year==1 else ly
+                    if tgt is None: return
+                    tgt['conv']=round2((txn/foot)*100) if foot else None
+                    tgt['upt']=round2(qty/txn) if txn else None
+                    tgt['aov']=round2(sales/txn) if txn else None
+                    if 'Cost Amt' in w.columns:
+                        c=pd.to_numeric(w['Cost Amt'],errors='coerce').sum()
+                        tgt['gp']=round2((1-c/sales)*100) if sales else None
+                _ratios(1); _ratios(0)
+            if p=='yesterday' and ty is not None and not lfl:
+                _m = _yt[_yt['Location'].isin(locs)]
                 if len(_m):
                     _fpa=_m['_fp_amt'].sum(); _ta=_m['Net Sales Amt'].sum()
                     _fpq=_m['_fp_qty'].sum(); _tq=_m['Net Sales Qty'].sum()
@@ -744,8 +807,8 @@ try:
                         ty['fp_units']=int(round(_fpq)); ty['tot_units']=int(round(_tq)); ty['fp_source']='tag'
             # GP% (both ty and ly) already set by agg_window from the KPI Cost Amt column.
             # Only the budget figures need to be added at the combined level.
-            if ty is not None:
-                _bt=sum_budget(mem,s,e)
+            if ty is not None and not lfl:
+                _bt=sum_budget(locs,s,e)
                 ty['budget']=round2(_bt) if _bt else None
                 ty['budget_pct']=round2(ty['sales']/_bt*100) if (_bt and ty.get('sales') is not None) else None
             blob_extra={'lfl_stores':len(mem)} if lfl else {}
@@ -812,8 +875,12 @@ for country, csub in g.groupby('Country'):
     rwk=np.where(cg['WTDqty']>0,(cg['WTDqty']/DAYS_ELAPSED)*7,np.nan)
     rmo=np.where(cg['MTDqty']>0,(cg['MTDqty']/DAYS_IN_MONTH)*7,np.nan)
     ryr=np.where(cg['YTDqty']>0,(cg['YTDqty']/DAYS_IN_YEAR)*7,np.nan)
-    cg['WC_week']=np.where(np.isfinite(rwk),cg['InvQty']/rwk,np.where(np.isfinite(rmo),cg['InvQty']/rmo,np.where(np.isfinite(ryr),cg['InvQty']/ryr,np.nan)))
-    cg['WC_month']=np.where(np.isfinite(rmo),cg['InvQty']/rmo,np.where(np.isfinite(ryr),cg['InvQty']/ryr,np.nan))
+    # short-window guard (same as per-store): ignore an unreliable rate from a period that
+    # hasn't accumulated enough days, falling through to the next-longer window.
+    _rwk = rwk if wtd_ok else np.full(len(cg), np.nan)
+    _rmo = rmo if mtd_ok else np.full(len(cg), np.nan)
+    cg['WC_week']=np.where(np.isfinite(_rwk),cg['InvQty']/_rwk,np.where(np.isfinite(_rmo),cg['InvQty']/_rmo,np.where(np.isfinite(ryr),cg['InvQty']/ryr,np.nan)))
+    cg['WC_month']=np.where(np.isfinite(_rmo),cg['InvQty']/_rmo,np.where(np.isfinite(ryr),cg['InvQty']/ryr,np.nan))
     cg['WC_year']=np.where(np.isfinite(ryr),cg['InvQty']/ryr,np.nan)
     blob['items']=candidate_items(cg[(cg['InvQty']>0)|(cg['YTDqty']>0)|(cg['YestQty']>0)]) \
                   + xcat_item_rows(country=country)
@@ -844,8 +911,11 @@ acg = g.groupby('Key').agg(
 rwk=np.where(acg['WTDqty']>0,(acg['WTDqty']/DAYS_ELAPSED)*7,np.nan)
 rmo=np.where(acg['MTDqty']>0,(acg['MTDqty']/DAYS_IN_MONTH)*7,np.nan)
 ryr=np.where(acg['YTDqty']>0,(acg['YTDqty']/DAYS_IN_YEAR)*7,np.nan)
-acg['WC_week']=np.where(np.isfinite(rwk),acg['InvQty']/rwk,np.where(np.isfinite(rmo),acg['InvQty']/rmo,np.where(np.isfinite(ryr),acg['InvQty']/ryr,np.nan)))
-acg['WC_month']=np.where(np.isfinite(rmo),acg['InvQty']/rmo,np.where(np.isfinite(ryr),acg['InvQty']/ryr,np.nan))
+# short-window guard (same as per-store / per-country)
+_rwk = rwk if wtd_ok else np.full(len(acg), np.nan)
+_rmo = rmo if mtd_ok else np.full(len(acg), np.nan)
+acg['WC_week']=np.where(np.isfinite(_rwk),acg['InvQty']/_rwk,np.where(np.isfinite(_rmo),acg['InvQty']/_rmo,np.where(np.isfinite(ryr),acg['InvQty']/ryr,np.nan)))
+acg['WC_month']=np.where(np.isfinite(_rmo),acg['InvQty']/_rmo,np.where(np.isfinite(ryr),acg['InvQty']/ryr,np.nan))
 acg['WC_year']=np.where(np.isfinite(ryr),acg['InvQty']/ryr,np.nan)
 all_blob['items']=candidate_items(acg[(acg['InvQty']>0)|(acg['YTDqty']>0)|(acg['YestQty']>0)])
 if kpi_store:
@@ -890,6 +960,15 @@ def build_store_rank(series, is_qty=False):
             rows.append({'store':r['Location'],'val':round2(r['val']),'rank':i+1,
                          'pct':round2(100*r['val']/tot) if tot else 0})
         out[c]=rows
+    # All-Countries roll-up: every physical store ranked across the whole GCC, so the
+    # default "All Countries" view has a populated store-ranking table.
+    allsub=df.sort_values('val',ascending=False).reset_index(drop=True)
+    tot=allsub['val'].sum()
+    rows=[]
+    for i,r in allsub.iterrows():
+        rows.append({'store':r['Location'],'val':round2(r['val']),'rank':i+1,
+                     'pct':round2(100*r['val']/tot) if tot else 0})
+    out['All Countries']=rows
     return out
 
 store_rank={
