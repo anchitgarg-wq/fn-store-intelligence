@@ -100,6 +100,14 @@ if _fpmd_col:
     bc2fpmd = _kf.drop_duplicates('Item Barcode').set_index('Item Barcode')['_tag'].to_dict()
     print(f'FP/MD tags loaded from master: {len(bc2fpmd)} barcodes')
 
+# Color Code -> total number of distinct sizes that exist for it in the system (master).
+# Drives size-availability = (distinct sizes in stock) / (total distinct sizes in system).
+cc_total_sizes = {}
+if 'Item Size' in key.columns and 'Color Code' in key.columns:
+    _ks = key.dropna(subset=['Color Code','Item Size'])
+    cc_total_sizes = _ks.groupby('Color Code')['Item Size'].nunique().to_dict()
+    print(f'Size-system map built for {len(cc_total_sizes)} color codes')
+
 # ---------------- Budget tab (store x date sales targets) ----------------
 # Budget achievement = actual sales / budget target, summed over the selected period.
 budget_by_loc_date = {}     # (normalised store name) -> {date: target}
@@ -182,7 +190,8 @@ _REQUIRED = ['Country','Location','Item Group','Item Department','Item Class',
              'Net Sales Amt (MTD)','Net Sales Qty (MTD)',
              'Net Sales Amt (YTD)','Net Sales Qty (YTD)',
              'Inventory Qty','Inventory Value','In Transit Qty']
-_OPTIONAL = ['Region','Unit Cost','Last recieved date store',
+_OPTIONAL = ['Region','Unit Cost','Last recieved date store','Item Size','Item Style Code',
+             'Item Subclass',
              'Cost Amt (WTD)','Cost Amt (MTD)','Cost Amt (YTD)',
              'Ageing Days','Unit Price','Original Price']
 _avail = set(pd.read_excel(MASTER_FILE, nrows=0).columns)
@@ -209,6 +218,8 @@ inv['Key']=inv['Item Barcode'].map(b2k).fillna('BC-'+inv['Item Barcode'])
 # so it matches the category taxonomy shown elsewhere on the dashboard.
 inv['Cat'] = [cat_for(k, g) for k, g in zip(inv['Key'], inv['Item Group'])]
 inv['Sub'] = [sub_for(k, d) for k, d in zip(inv['Key'], inv['Item Department'])]
+# FP/MD tag per row from the authoritative master barcode map (for the inventory snapshot).
+inv['FPMD'] = inv['Item Barcode'].map(bc2fpmd)
 # Last-received date drives the "exclude last-30-day arrivals" rule on bottom sellers.
 # If the date column is absent, fall back to Ageing Days (>30 days => not a new arrival).
 if 'Last recieved date store' in inv.columns:
@@ -579,6 +590,95 @@ def in_transit(df):
     return [{'group':r['Cat'],'dept':r['Sub'],'qty':round2(r['In Transit Qty'])}
             for _,r in it.iterrows()]
 
+# ---------------- inventory snapshot (FP/MD mix, season mix, style counts, size avail) ----------------
+# Season bucketing: named current/recent seasons kept; everything else -> "Older".
+_SEASON_KEEP = [('SPRING 2026','Spring 2026'),('SUMMER 2026','Summer 2026'),
+                ('AUTUMN 2025','Autumn 2025'),('WINTER 2025','Winter 2025')]
+def _season_bucket(s):
+    u=str(s).upper()
+    for k,lab in _SEASON_KEEP:
+        if k in u: return lab
+    return 'Older'
+_SEASON_ORDER = ['Spring 2026','Summer 2026','Autumn 2025','Winter 2025','Older']
+
+def inventory_snapshot(df):
+    """Build the 4-part inventory snapshot for an inventory sub-frame (a store or a
+    combined set). All sections use in-stock rows (Inventory Qty > 0). Both a units basis
+    (Inventory Qty) and a value basis (Inventory Value) are emitted so the dashboard can
+    toggle between them client-side."""
+    sub = df[df['Inventory Qty'] > 0].copy()
+    if sub.empty:
+        return {'fpmd':[],'season':[],'style':[],'size':[],'total_cc':0,
+                'total_units':0,'total_value':0}
+    sub['_sb'] = sub['Season'].map(_season_bucket)
+    qcol = pd.to_numeric(sub['Inventory Qty'],errors='coerce').fillna(0)
+    vcol = pd.to_numeric(sub['Inventory Value'],errors='coerce').fillna(0)
+    sub['_q']=qcol; sub['_v']=vcol
+
+    # 1) FP/MD stock mix by category — units and value, FP vs MD
+    fpmd=[]
+    for cat, c in sub.groupby('Cat'):
+        fp=c[c['FPMD']=='FP']; md=c[c['FPMD']=='MD']
+        fpmd.append({'cat':cat,
+                     'fp_q':round2(fp['_q'].sum()),'md_q':round2(md['_q'].sum()),
+                     'fp_v':round2(fp['_v'].sum()),'md_v':round2(md['_v'].sum()),
+                     'tot_q':round2(c['_q'].sum()),'tot_v':round2(c['_v'].sum())})
+    fpmd.sort(key=lambda x:-x['tot_q'])
+
+    # 2) Season mix — units and value per bucket (fixed order)
+    season=[]
+    sg=sub.groupby('_sb').agg(q=('_q','sum'),v=('_v','sum'))
+    for s in _SEASON_ORDER:
+        if s in sg.index:
+            season.append({'s':s,'q':round2(sg.loc[s,'q']),'v':round2(sg.loc[s,'v'])})
+        else:
+            season.append({'s':s,'q':0,'v':0})
+
+    # 3) Active style-code count by category (distinct color codes with stock)
+    style=[]
+    for cat, c in sub.groupby('Cat'):
+        style.append({'cat':cat,'n':int(c['Key'].nunique())})
+    style.sort(key=lambda x:-x['n'])
+
+    # 4) Size availability by category + sub category.
+    # Per color code: (distinct sizes in stock) / (total distinct sizes in system from master),
+    # capped at 1.0. Rolled up as the equal-weighted mean across color codes (one vote per style).
+    def _avail(frame):
+        if 'Item Size' not in frame.columns: return None
+        instock = frame.groupby('Key')['Item Size'].nunique()
+        ratios=[]
+        for cc in frame['Key'].unique():
+            tot = cc_total_sizes.get(cc)
+            if tot and tot>0:
+                ratios.append(min(instock.get(cc,0)/tot, 1.0))
+        return round2(100*sum(ratios)/len(ratios)) if ratios else None
+    size=[]
+    for cat, c in sub.groupby('Cat'):
+        subs=[]
+        for sname, cc in c.groupby('Sub'):
+            av=_avail(cc)
+            if av is not None:
+                subs.append({'sub':sname,'av':av,'cc':int(cc['Key'].nunique())})
+        subs.sort(key=lambda x:-x['cc'])
+        size.append({'cat':cat,'av':_avail(c),'cc':int(c['Key'].nunique()),'subs':subs})
+    size=[s for s in size if s['av'] is not None]
+    size.sort(key=lambda x:-x['cc'])
+
+    # ---- overall totals (one row per table), respecting the same in-stock filter ----
+    fp_all=sub[sub['FPMD']=='FP']; md_all=sub[sub['FPMD']=='MD']
+    tot_fpmd={'fp_q':round2(fp_all['_q'].sum()),'md_q':round2(md_all['_q'].sum()),
+              'fp_v':round2(fp_all['_v'].sum()),'md_v':round2(md_all['_v'].sum()),
+              'tot_q':round2(sub['_q'].sum()),'tot_v':round2(sub['_v'].sum())}
+    tot_season={'q':round2(sub['_q'].sum()),'v':round2(sub['_v'].sum())}
+    tot_style=int(sub['Key'].nunique())
+    tot_size=_avail(sub)   # overall equal-weighted size availability across every stocked style
+
+    return {'fpmd':fpmd,'season':season,'style':style,'size':size,
+            'totals':{'fpmd':tot_fpmd,'season':tot_season,'style':tot_style,'size':tot_size},
+            'total_cc':int(sub['Key'].nunique()),
+            'total_units':round2(sub['_q'].sum()),
+            'total_value':round2(sub['_v'].sum())}
+
 # ---------------- per-store summary ----------------
 # KPI source (daily, dated) — footfall/conversion/qty/full-price/UPT with LY comparison
 KPI_FILE = U+'04__Store_KPI__For_Live_Dashboard_-_Anchit_.xlsx'
@@ -847,6 +947,7 @@ for loc, sub in g.groupby('Location'):
           'cat_pivot':cat_pivot(sub),
           'in_transit':in_transit(inv_sub),
           'transit_items':transit_items(loc),
+          'inv_snapshot':inventory_snapshot(inv_sub),
           'kpi':kpi_store.get(loc),
           'kpi_lfl':kpi_lfl_store.get(loc)}
     stores[loc]=blob
@@ -861,6 +962,7 @@ for country, csub in g.groupby('Country'):
           'cat_pivot':cat_pivot(csub),
           'in_transit':in_transit(inv_c),
           'transit_items':transit_items_df(inv_c),
+          'inv_snapshot':inventory_snapshot(inv_c),
           'kpi':None}
     # country-wide: aggregate the same Key across all stores in the country
     cg = csub.groupby('Key').agg(
@@ -898,6 +1000,7 @@ all_blob = {'country':'All Countries','region':'All regions','is_combined':True,
             'cat_pivot':cat_pivot(g),
             'in_transit':in_transit(_allinv),
             'transit_items':transit_items_df(_allinv),
+            'inv_snapshot':inventory_snapshot(_allinv),
             'kpi':None}
 acg = g.groupby('Key').agg(
     Desc=('Desc','first'),Group=('Group','first'),Dept=('Dept','first'),Cls=('Cls','first'),
