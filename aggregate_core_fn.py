@@ -65,8 +65,19 @@ _desc = knames['Item Description'] if 'Item Description' in knames.columns else 
 _col  = knames['Item Color'] if 'Item Color' in knames.columns else ['']*len(knames)
 knames['disp'] = [clean_name(a,b) for a,b in zip(_desc, _col)]
 key2name = knames[knames['disp']!=''].drop_duplicates('Color Code').set_index('Color Code')['disp'].to_dict()
-# Color Code -> Category / Sub category (used for merchandise naming if needed)
-cc2cat = key.dropna(subset=['Color Code']).drop_duplicates('Color Code').set_index('Color Code')['Category'].to_dict() if 'Category' in key.columns else {}
+# Color Code -> Category / Sub category from the master. These become the displayed
+# group (Category) and dept (Sub category) on the dashboard, replacing the coarser
+# inventory Item Group / Item Department for LABELLING only. Merchandise-scope EXCLUSION
+# still uses the inventory Item Department (NON MERCHANDISE / SHOPPING BAGS) untouched.
+_kc = key.dropna(subset=['Color Code']).drop_duplicates('Color Code').set_index('Color Code')
+cc2cat = _kc['Category'].to_dict() if 'Category' in key.columns else {}
+cc2sub = _kc['Sub category'].to_dict() if 'Sub category' in key.columns else {}
+def cat_for(code, fallback_group=None):
+    v = cc2cat.get(code)
+    return v if (isinstance(v,str) and v.strip()) else (fallback_group or 'Uncategorized')
+def sub_for(code, fallback_dept=None):
+    v = cc2sub.get(code)
+    return v if (isinstance(v,str) and v.strip()) else (fallback_dept or 'Uncategorized')
 
 # ---------------- image lookup (FN: color code -> Image Link) ----------------
 key2img = {}
@@ -257,6 +268,11 @@ g = inv.groupby(['Country','Region','Location','Key']).agg(
         InvQty=('Inventory Qty','sum'), InvValue=('Inventory Value','sum'),
         StockCost=('StockCost','sum'), UnitCost=('Unit Cost','mean'),
     ).reset_index()
+# Relabel group (Category) and dept (Sub category) from the FN_Color_Code_Master, keyed by
+# Color Code (== Key). Inventory's Item Group/Department remain only as a fallback when a
+# color code has no master Category/Sub. Exclusion was already applied on inventory above.
+g['Group'] = [cat_for(k, fg) for k, fg in zip(g['Key'], g['Group'])]
+g['Dept']  = [sub_for(k, fd) for k, fd in zip(g['Key'], g['Dept'])]
 g = g.merge(yd_key, on=['Location','Key'], how='left')
 g[['YestAmt','YestQty']] = g[['YestAmt','YestQty']].fillna(0)
 
@@ -357,8 +373,10 @@ def xcat_item_rows(loc=None, country=None):
         ya=round2(r['YestAmt']); yq=round2(r['YestQty'])
         asp=round2(r['YestAmt']/r['YestQty']) if r['YestQty'] else None
         name=key2name.get(r['Key']) or strip_size(str(r['Desc']), r['Key'])
+        _grp = cat_for(r['Key'], str(r['Group']).title())
+        _dpt = sub_for(r['Key'], str(r['Dept']).title())
         out.append({
-            'key':r['Key'],'desc':name,'group':str(r['Group']).title(),'dept':str(r['Dept']).title(),
+            'key':r['Key'],'desc':name,'group':_grp,'dept':_dpt,
             'cls':None,'season':None,'cur_season':False,'gm':None,'fpmd':None,'recent':False,
             'inv_qty':None,'stock_cost':None,'img':key2img.get(r['Key']),'xcat':True,
             'p':{'yesterday':[ya,yq,asp,None,'none'],
