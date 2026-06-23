@@ -600,7 +600,7 @@ try:
             _med = kdf[c].dropna().median()
             if pd.notna(_med) and _med > 1.5:   # typical value looks like 0-100 -> to 0-1
                 kdf[c] = kdf[c] / 100.0
-    for c in ['Net Sales Amt','Net Sales Qty','Footfall','UPT']:
+    for c in ['Net Sales Amt','Net Sales Qty','Footfall','UPT','Cost Amt']:
         if c in kdf.columns:
             kdf[c] = pd.to_numeric(kdf[c], errors='coerce')
     # The KPI/footfall export commonly lags the sales/inventory pull by a day or more.
@@ -644,9 +644,17 @@ try:
         _fpsales = _fpvalid['Net Sales Amt'].sum()
         fp = ((_fpvalid['Full Price Sales %']*_fpvalid['Net Sales Amt']).sum()/_fpsales
               if _fpsales else None)
+        # GP% = 1 - cost/sales, from the KPI file's Cost Amt column. Because agg_window runs
+        # for both the TY and LY windows, this yields GP% for last year automatically, enabling
+        # the vs-LY comparison on the GP tile. Falls back to None if cost is absent.
+        gp = None
+        if 'Cost Amt' in w.columns:
+            _cost = pd.to_numeric(w['Cost Amt'],errors='coerce').sum()
+            gp = (1 - _cost/sales) if (sales and sales!=0) else None
         return {'sales':round2(sales),'qty':round2(qty),'footfall':round2(foot),
                 'conv':round2(convp*100 if convp is not None else None),
                 'fullprice':round2(fp*100 if fp is not None else None),
+                'gp':round2(gp*100 if gp is not None else None),
                 'upt':round2(upt),'aov':round2(aov)}
     for loc, sub in kdf.groupby('Location'):
         per={}
@@ -665,10 +673,8 @@ try:
                     ty['fp_units']    = _f['fp_units']
                     ty['tot_units']   = _f['tot_units']
                     ty['fp_source']   = 'tag'
-            # GP% (1 - cost/sales) for this store/period
-            if ty is not None:
-                _g = gp_store.get(loc, {}).get(p)
-                ty['gp'] = round2(_g*100 if _g is not None else None)
+            # GP% now comes from agg_window (KPI file Cost Amt), computed for BOTH ty and ly,
+            # so the vs-LY comparison works. No inventory-based override needed.
             # Budget achievement: actual sales / sum of daily targets over the period window
             if ty is not None:
                 _bt = sum_budget(loc, s, e)
@@ -721,21 +727,9 @@ try:
                     if _apct is not None:
                         ty['fullprice']=round2(_apct*100); ty['fp_unit_pct']=round2(_upct*100 if _upct is not None else None)
                         ty['fp_units']=int(round(_fpq)); ty['tot_units']=int(round(_tq)); ty['fp_source']='tag'
-            # GP% combined
+            # GP% (both ty and ly) already set by agg_window from the KPI Cost Amt column.
+            # Only the budget figures need to be added at the combined level.
             if ty is not None:
-                if p=='yesterday':
-                    _ys=_yt[_yt['Location'].isin(mem)] if len(_yt) else None
-                    if _ys is not None and 'Cost Amt' in yd.columns:
-                        _yc=yd[yd['Location'].isin(mem)]
-                        c=pd.to_numeric(_yc['Cost Amt'],errors='coerce').sum(); sa=pd.to_numeric(_yc['Net Sales Amt'],errors='coerce').sum()
-                        ty['gp']=round2((1-c/sa)*100) if sa else None
-                else:
-                    colmap={'wtd':('Net Sales Amt (WTD)','Cost Amt (WTD)'),
-                            'mtd':('Net Sales Amt (MTD)','Cost Amt (MTD)'),
-                            'ytd':('Net Sales Amt (YTD)','Cost Amt (YTD)')}
-                    sc,cc=colmap[p]; _gpv=_gp_combined(mem,sc,cc)
-                    ty['gp']=round2(_gpv*100 if _gpv is not None else None)
-                # Budget combined
                 _bt=sum_budget(mem,s,e)
                 ty['budget']=round2(_bt) if _bt else None
                 ty['budget_pct']=round2(ty['sales']/_bt*100) if (_bt and ty.get('sales') is not None) else None
