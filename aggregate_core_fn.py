@@ -99,6 +99,13 @@ if _fpmd_col:
     _kf = _kf[_kf['_tag'].isin(['FP','MD'])]
     bc2fpmd = _kf.drop_duplicates('Item Barcode').set_index('Item Barcode')['_tag'].to_dict()
     print(f'FP/MD tags loaded from master: {len(bc2fpmd)} barcodes')
+cc2fpmd = {}
+if _fpmd_col and 'Color Code' in key.columns:
+    _cf = key.dropna(subset=['Color Code']).copy()
+    _cf['_tag'] = _cf[_fpmd_col].astype(str).str.strip().str.upper()
+    _cf = _cf[_cf['_tag'].isin(['FP','MD'])]
+    cc2fpmd = _cf.drop_duplicates('Color Code').set_index('Color Code')['_tag'].to_dict()
+    print(f'FP/MD tags by color code: {len(cc2fpmd)} codes')
 
 # Color Code -> total number of distinct sizes that exist for it in the system (master).
 # Drives size-availability = (distinct sizes in stock) / (total distinct sizes in system).
@@ -434,7 +441,8 @@ def _wcstatus(r,col):
 def item_row(r):
     """Full attributes for one Key at one store, for client-side ranking/filtering."""
     gm = gm_freshest(r)
-    fpmd = None if gm is None else ('FP' if gm>=75 else 'MD')
+    _mt = cc2fpmd.get(r['Key'])
+    fpmd = _mt if _mt in ('FP','MD') else (None if gm is None else ('FP' if gm>=75 else 'MD'))
     lr = r['LastRecv']
     recent = bool(pd.notna(lr) and lr.date()>recent_cutoff)
     name = key2name.get(r['Key']) or strip_size(r['Desc'], r['Key'])
