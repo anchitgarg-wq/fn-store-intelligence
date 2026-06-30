@@ -758,6 +758,7 @@ try:
         convp = (txn/foot) if foot else None            # conversion% = total txns / total footfall
         upt   = (qty/txn) if txn else None              # UPT = total units / total transactions
         aov   = (sales/txn) if txn else None            # AOV = total sales / total transactions
+        asp   = (sales/qty) if qty else None            # ASP = total sales / total units
         # FP% revenue-weighted from valid rows only. Corrupt KPI rows (e.g. 2699%, -900%)
         # are excluded; if no valid rows remain, fp is None and the ORP fallback applies
         # (yesterday) downstream.
@@ -776,7 +777,7 @@ try:
                 'conv':round2(convp*100 if convp is not None else None),
                 'fullprice':round2(fp*100 if fp is not None else None),
                 'gp':round2(gp*100 if gp is not None else None),
-                'upt':round2(upt),'aov':round2(aov)}
+                'upt':round2(upt),'aov':round2(aov),'asp':round2(asp)}
     for loc, sub in kdf.groupby('Location'):
         per={}
         for p in ['yesterday','wtd','mtd','ytd']:
@@ -879,7 +880,8 @@ try:
                     # rebuild ratio KPIs from summed components where possible
                     conv=None; upt=None; aov=None
                     return {'sales':round2(sales),'qty':round2(qty),'footfall':round2(foot),
-                            'conv':None,'fullprice':None,'gp':None,'upt':None,'aov':None}
+                            'conv':None,'fullprice':None,'gp':None,'upt':None,'aov':None,
+                            'asp':round2((sales/qty) if qty else None)}
                 ty=_agg_parts(_sum_clipped(1)); ly=_agg_parts(_sum_clipped(0))
                 # recompute GP, conv, upt, aov for the clipped cohort from raw rows
                 def _ratios(parts_year):
