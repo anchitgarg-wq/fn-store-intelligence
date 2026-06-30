@@ -623,6 +623,11 @@ def _season_bucket(s):
     return 'Older'
 _SEASON_ORDER = ['Spring 2026','Summer 2026','Autumn 2025','Winter 2025','Older']
 
+# Size-set completeness threshold: a color code counts as a "full set" when it has at least
+# this many DISTINCT in-stock sizes; fewer (1..N-1) is "broken". Tune here if the apparel
+# size run changes. NOTE: one-size / very-short-run styles read as "broken" under an absolute
+# threshold — see the size-set card notes.
+SIZESET_FULL_MIN = 4
 def inventory_snapshot(df):
     """Build the 4-part inventory snapshot for an inventory sub-frame (a store or a
     combined set). All sections use in-stock rows (Inventory Qty > 0). Both a units basis
@@ -630,7 +635,7 @@ def inventory_snapshot(df):
     toggle between them client-side."""
     sub = df[df['Inventory Qty'] > 0].copy()
     if sub.empty:
-        return {'fpmd':[],'season':[],'style':[],'size':[],'total_cc':0,
+        return {'fpmd':[],'season':[],'style':[],'size':[],'sizeset':[],'total_cc':0,
                 'total_units':0,'total_value':0}
     sub['_sb'] = sub['Season'].map(_season_bucket)
     qcol = pd.to_numeric(sub['Inventory Qty'],errors='coerce').fillna(0)
@@ -686,6 +691,38 @@ def inventory_snapshot(df):
     size=[s for s in size if s['av'] is not None]
     size.sort(key=lambda x:-x['cc'])
 
+    # 5) Size-set completeness by category + sub category, split FP vs MD.
+    # Per color code: count DISTINCT in-stock sizes (sub is already Inventory Qty>0). A color
+    # code is a "full set" when it has >= SIZESET_FULL_MIN distinct in-stock sizes, else "broken".
+    # comp = % of in-stock color codes that are full sets (higher = better). FP/MD split uses the
+    # master per-color-code tag (cc2fpmd); untagged color codes still count toward the overall.
+    def _setcomp(frame):
+        if 'Item Size' not in frame.columns or frame.empty:
+            return {'comp':None,'total_cc':0,'full_cc':0,'fp_comp':None,'fp_cc':0,'md_comp':None,'md_cc':0}
+        nsizes = frame.groupby('Key')['Item Size'].nunique()
+        a_full=a_tot=fp_full=fp_tot=md_full=md_tot=0
+        for cc, n in nsizes.items():
+            full = 1 if n >= SIZESET_FULL_MIN else 0
+            a_tot+=1; a_full+=full
+            tag = cc2fpmd.get(cc)
+            if tag=='FP': fp_tot+=1; fp_full+=full
+            elif tag=='MD': md_tot+=1; md_full+=full
+        _pct=lambda f,t: round2(100*f/t) if t else None
+        return {'comp':_pct(a_full,a_tot),'total_cc':int(a_tot),'full_cc':int(a_full),
+                'fp_comp':_pct(fp_full,fp_tot),'fp_cc':int(fp_tot),
+                'md_comp':_pct(md_full,md_tot),'md_cc':int(md_tot)}
+    sizeset=[]
+    for cat, c in sub.groupby('Cat'):
+        subs=[]
+        for sname, cc in c.groupby('Sub'):
+            row=_setcomp(cc)
+            if row['total_cc']>0: subs.append({'sub':sname, **row})
+        subs.sort(key=lambda x:-x['total_cc'])
+        crow=_setcomp(c)
+        if crow['total_cc']>0:
+            sizeset.append({'cat':cat, **crow, 'subs':subs})
+    sizeset.sort(key=lambda x:-x['total_cc'])
+
     # ---- overall totals (one row per table), respecting the same in-stock filter ----
     fp_all=sub[sub['FPMD']=='FP']; md_all=sub[sub['FPMD']=='MD']
     tot_fpmd={'fp_q':round2(fp_all['_q'].sum()),'md_q':round2(md_all['_q'].sum()),
@@ -694,9 +731,10 @@ def inventory_snapshot(df):
     tot_season={'q':round2(sub['_q'].sum()),'v':round2(sub['_v'].sum())}
     tot_style=int(sub['Key'].nunique())
     tot_size=_avail(sub)   # overall equal-weighted size availability across every stocked style
+    tot_sizeset=_setcomp(sub)  # overall size-set completeness (FP/MD split) across all stocked color codes
 
-    return {'fpmd':fpmd,'season':season,'style':style,'size':size,
-            'totals':{'fpmd':tot_fpmd,'season':tot_season,'style':tot_style,'size':tot_size},
+    return {'fpmd':fpmd,'season':season,'style':style,'size':size,'sizeset':sizeset,
+            'totals':{'fpmd':tot_fpmd,'season':tot_season,'style':tot_style,'size':tot_size,'sizeset':tot_sizeset},
             'total_cc':int(sub['Key'].nunique()),
             'total_units':round2(sub['_q'].sum()),
             'total_value':round2(sub['_v'].sum())}
