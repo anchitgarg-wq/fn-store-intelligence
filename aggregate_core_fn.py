@@ -1118,6 +1118,62 @@ for c,sc in geo.groupby('Country'):
     for r,sr in sc.groupby('Region'):
         filters['tree'][c][r]=sorted(sr['Location'].unique().tolist())
 
+# ---------------- weekly trend (last 8 ISO weeks) — Weekly Sales + Multi-Week KPI ----------------
+# Mirrors SM. Uses the dated KPI file (kdf) + agg_window; only runs if KPI data loaded.
+# Per-week series, read by the charts as weekly['all' | 'country'[cn] | 'store'[loc]].
+# Wrapped in try/except so a KPI hiccup hides the charts instead of breaking the refresh.
+WEEKLY_N = 8
+weekly = {'weeks':[], 'all':{}, 'country':{}, 'store':{}}
+try:
+    if kpi_store:
+        _METRICS = ['conv','upt','footfall','aov','asp']
+        _end_week_monday = KPI_ASOF - dt.timedelta(days=KPI_ASOF.weekday())
+        _weeks=[]
+        for i in range(WEEKLY_N-1, -1, -1):
+            wmon = _end_week_monday - dt.timedelta(weeks=i)
+            wsun = wmon + dt.timedelta(days=6)
+            iso = wmon.isocalendar()
+            _weeks.append({'iso':f'{iso[0]}-W{iso[1]:02d}','label':f'Wk {iso[1]}',
+                           'start':wmon.isoformat(),'end':wsun.isoformat(),
+                           '_mon':wmon,'_sun':wsun})
+        weekly['weeks']=[{k:w[k] for k in ('iso','label','start','end')} for w in _weeks]
+        def _series_for(sub):
+            out={'sales_ty':[], 'sales_ly':[], 'sales_bud':[]}
+            for m in _METRICS: out[m]=[]
+            for w in _weeks:
+                s,e=w['_mon'],w['_sun']
+                ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
+                ty=agg_window(sub,s,e); ly=agg_window(sub,ls,le)
+                out['sales_ty'].append(round2(ty['sales']) if ty else None)
+                out['sales_ly'].append(round2(ly['sales']) if ly else None)
+                for m in _METRICS:
+                    out[m].append((ty.get(m) if ty else None))
+            return out
+        def _bud_series(locs):
+            arr=[]
+            for w in _weeks:
+                bs=sum_budget(locs, w['_mon'], w['_sun'])     # FN: single-budget 3-arg signature
+                arr.append(round2(bs) if bs else None)
+            return arr
+        _all_locs=list(kdf['Location'].dropna().unique())
+        _a=_series_for(kdf); _a['sales_bud']=_bud_series(_all_locs)
+        weekly['all']=_a
+        for _cn in sorted(set(store_country.values())):
+            _locs=[l for l in _all_locs if store_country.get(l)==_cn]
+            if not _locs: continue
+            _csub=kdf[kdf['Location'].isin(_locs)]
+            _s=_series_for(_csub); _s['sales_bud']=_bud_series(_locs)
+            weekly['country'][_cn]=_s
+        for _loc in _all_locs:
+            _ssub=kdf[kdf['Location']==_loc]
+            _s=_series_for(_ssub); _s['sales_bud']=_bud_series([_loc])
+            weekly['store'][_loc]=_s
+    else:
+        print('weekly trend skipped: no KPI data')
+except Exception as _wex:
+    print('weekly trend build failed (charts will hide):', _wex)
+    weekly = {'weeks':[], 'all':{}, 'country':{}, 'store':{}}
+
 summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
                  'days_elapsed_month':DAYS_IN_MONTH,'days_elapsed_year':DAYS_IN_YEAR,
                  'generated':dt.datetime.now().isoformat(timespec='seconds'),
@@ -1126,6 +1182,7 @@ summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
          'filters':filters,'country_rank':country_rank,'store_rank':store_rank,
          'store_country':store_country,
          'country_blobs':country_blobs,
+         'weekly':weekly,
          'stores':stores}
 
 json.dump(summary, open(OUT,'w'), separators=(',',':'))
