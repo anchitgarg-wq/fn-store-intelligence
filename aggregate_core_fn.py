@@ -575,14 +575,14 @@ def cat_pivot(df):
     """Group -> Dept -> Class tree. Sales (rev/qty) are emitted PER PERIOD so the dashboard's
     period selector (Yesterday/WTD/MTD/YTD) drives the sales columns; stock (scost/sqty) is a
     single CURRENT snapshot and is intentionally period-independent.
-    NOTE: WTD revenue is treated as unavailable (rev['wtd']=None), matching the dashboard-wide
-    'WTD is qty-only' convention; wtd qty is real. Frontend reads rev[period]/qty[period] and
+    NOTE: WTD revenue IS real in FN's source, so rev['wtd'] is emitted (unlike SM). Frontend
+    reads rev[period]/qty[period] and
     recomputes mix % within the selected period's grand total. Node ordering uses YTD revenue
     (populated for every node) so the tree's sort is stable across period switches."""
     def node_vals(sub):
         return {
             'rev':{'yesterday':round2(sub['YestAmt'].sum()),
-                   'wtd':None,
+                   'wtd':round2(sub['WTDamt'].sum()),
                    'mtd':round2(sub['MTDamt'].sum()),
                    'ytd':round2(sub['YTDamt'].sum())},
             'qty':{'yesterday':round2(sub['YestQty'].sum()),
