@@ -572,11 +572,25 @@ def cat_mix(df, level):
     return sorted(out, key=lambda x:-(x['sales_mix_rev'] or 0))
 
 def cat_pivot(df):
-    """Group -> Dept -> Class tree with raw rev/qty/stock_cost/inv_qty per node.
-    Frontend computes parent-relative and grand-total % and applies the Value/Qty toggle."""
+    """Group -> Dept -> Class tree. Sales (rev/qty) are emitted PER PERIOD so the dashboard's
+    period selector (Yesterday/WTD/MTD/YTD) drives the sales columns; stock (scost/sqty) is a
+    single CURRENT snapshot and is intentionally period-independent.
+    NOTE: WTD revenue is treated as unavailable (rev['wtd']=None), matching the dashboard-wide
+    'WTD is qty-only' convention; wtd qty is real. Frontend reads rev[period]/qty[period] and
+    recomputes mix % within the selected period's grand total. Node ordering uses YTD revenue
+    (populated for every node) so the tree's sort is stable across period switches."""
     def node_vals(sub):
-        return {'rev':round2(sub['MTDamt'].sum()),'qty':round2(sub['MTDqty'].sum()),
-                'scost':round2(sub['StockCost'].sum()),'sqty':round2(sub['InvQty'].sum())}
+        return {
+            'rev':{'yesterday':round2(sub['YestAmt'].sum()),
+                   'wtd':None,
+                   'mtd':round2(sub['MTDamt'].sum()),
+                   'ytd':round2(sub['YTDamt'].sum())},
+            'qty':{'yesterday':round2(sub['YestQty'].sum()),
+                   'wtd':round2(sub['WTDqty'].sum()),
+                   'mtd':round2(sub['MTDqty'].sum()),
+                   'ytd':round2(sub['YTDqty'].sum())},
+            'scost':round2(sub['StockCost'].sum()),'sqty':round2(sub['InvQty'].sum())}
+    def _sk(n): return -(n['rev'].get('ytd') or 0)
     tree=[]
     for grp, gsub in df.groupby('Group'):
         gnode={'name':grp, **node_vals(gsub), 'children':[]}
@@ -584,11 +598,11 @@ def cat_pivot(df):
             dnode={'name':dept, **node_vals(dsub), 'children':[]}
             for cls, csub2 in dsub.groupby('Cls'):
                 dnode['children'].append({'name':cls, **node_vals(csub2)})
-            dnode['children'].sort(key=lambda x:-(x['rev'] or 0))
+            dnode['children'].sort(key=_sk)
             gnode['children'].append(dnode)
-        gnode['children'].sort(key=lambda x:-(x['rev'] or 0))
+        gnode['children'].sort(key=_sk)
         tree.append(gnode)
-    tree.sort(key=lambda x:-(x['rev'] or 0))
+    tree.sort(key=_sk)
     return tree
 
 # ---------------- in-transit by category/sub category (from master) ----------------
