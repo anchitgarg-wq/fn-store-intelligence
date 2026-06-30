@@ -693,7 +693,8 @@ def inventory_snapshot(df):
 
     # 5) Size-set completeness by category + sub category, split FP vs MD.
     # Per color code: count DISTINCT in-stock sizes (sub is already Inventory Qty>0). A color
-    # code is a "full set" when it has >= SIZESET_FULL_MIN distinct in-stock sizes, else "broken".
+    # code is a "full set" when it has >= SIZESET_FULL_MIN distinct in-stock sizes, OR has all of
+    # its system sizes in stock (so one-size / short-run styles aren't unfairly marked broken).
     # comp = % of in-stock color codes that are full sets (higher = better). FP/MD split uses the
     # master per-color-code tag (cc2fpmd); untagged color codes still count toward the overall.
     def _setcomp(frame):
@@ -702,7 +703,7 @@ def inventory_snapshot(df):
         nsizes = frame.groupby('Key')['Item Size'].nunique()
         a_full=a_tot=fp_full=fp_tot=md_full=md_tot=0
         for cc, n in nsizes.items():
-            full = 1 if n >= SIZESET_FULL_MIN else 0
+            full = 1 if (n >= SIZESET_FULL_MIN or (cc_total_sizes.get(cc) and n >= cc_total_sizes.get(cc))) else 0
             a_tot+=1; a_full+=full
             tag = cc2fpmd.get(cc)
             if tag=='FP': fp_tot+=1; fp_full+=full
