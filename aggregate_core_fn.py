@@ -1212,7 +1212,38 @@ try:
 except Exception as _wex:
     print('weekly trend build failed (charts will hide):', _wex)
     weekly = {'weeks':[], 'all':{}, 'country':{}, 'store':{}}
-
+# ---------------- country-level performance (per period) ----------------
+# Mirrors the SM country_perf block. Margin TY/LY are DERIVED (sales*gp/100) via _abs_margin,
+# not read from a budget-margin tab, so FN needs only sales+gp+footfall from its KPI window
+# (all present in agg_window) plus its single-budget fields. FN differences vs SM:
+#   * budget fields are 'budget' / 'budget_pct' (single budget), not 'bud_rebudget_sales'.
+#   * no margin-budget in FN, and the card never renders one, so no margin_bud key is emitted.
+def _abs_margin(d):
+    if not d: return None
+    s=d.get('sales'); gp=d.get('gp')
+    if s is None or gp is None: return None
+    return round2(s*gp/100.0)
+country_perf={}
+for _p in ['yesterday','wtd','mtd','ytd']:
+    rows=[]
+    for _cn, _blob in country_blobs.items():
+        if _cn=='All Countries': continue
+        _k=(_blob.get('kpi') or {}).get(_p) or {}
+        _ty=_k.get('ty') or {}; _ly=_k.get('ly') or {}
+        if not _ty and not _ly: continue
+        rows.append({
+            'country':_cn,
+            'sales_ty':_ty.get('sales'),
+            'sales_ly':_ly.get('sales'),
+            'sales_bud':_ty.get('budget'),
+            'sales_bud_pct':_ty.get('budget_pct'),
+            'margin_ty':_abs_margin(_ty),
+            'margin_ly':_abs_margin(_ly),
+            'footfall_ty':_ty.get('footfall'),
+            'footfall_ly':_ly.get('footfall'),
+        })
+    rows.sort(key=lambda r:-(r['sales_ty'] or 0))
+    country_perf[_p]=rows
 summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
                  'days_elapsed_month':DAYS_IN_MONTH,'days_elapsed_year':DAYS_IN_YEAR,
                  'generated':dt.datetime.now().isoformat(timespec='seconds'),
@@ -1221,6 +1252,7 @@ summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
          'filters':filters,'country_rank':country_rank,'store_rank':store_rank,
          'store_country':store_country,
          'country_blobs':country_blobs,
+         'country_perf':country_perf,
          'weekly':weekly,
          'stores':stores}
 
