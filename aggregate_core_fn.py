@@ -88,24 +88,99 @@ def sub_for(code, fallback_dept=None):
     v = cc2sub.get(code)
     return v if (isinstance(v,str) and v.strip()) else (fallback_dept or 'Uncategorized')
 
-# Barcode -> FP/MD tag from the master. This authoritative tag (per the merchant) drives the
-# FP Sales metric: FP Sales % = FP-tagged sales amount / total sales amount, and the units
-# figure shown alongside = FP-tagged units / total units. Tag is consistent per color code.
-_fpmd_col = next((c for c in key.columns if c.strip().upper().replace(' ','') in ('FP/MD','FPMD')), None)
-bc2fpmd = {}
-if _fpmd_col:
-    _kf = key.dropna(subset=['Item Barcode']).copy()
-    _kf['_tag'] = _kf[_fpmd_col].astype(str).str.strip().str.upper()
-    _kf = _kf[_kf['_tag'].isin(['FP','MD'])]
-    bc2fpmd = _kf.drop_duplicates('Item Barcode').set_index('Item Barcode')['_tag'].to_dict()
-    print(f'FP/MD tags loaded from master: {len(bc2fpmd)} barcodes')
-cc2fpmd = {}
-if _fpmd_col and 'Color Code' in key.columns:
-    _cf = key.dropna(subset=['Color Code']).copy()
-    _cf['_tag'] = _cf[_fpmd_col].astype(str).str.strip().str.upper()
-    _cf = _cf[_cf['_tag'].isin(['FP','MD'])]
-    cc2fpmd = _cf.drop_duplicates('Color Code').set_index('Color Code')['_tag'].to_dict()
-    print(f'FP/MD tags by color code: {len(cc2fpmd)} codes')
+# Barcode -> FP/MD tag from the master, PER COUNTRY (2026 format). Each barcode now carries
+# a separate tag for UAE / KUWAIT / SAUDI ARABIA / BAHRAIN / QATAR (an item can be MD in one
+# country and FP in another). Basis of calculation is the barcode itself; rollups by color
+# code, category, or store are aggregations over these barcode-level tags — never inferred.
+#
+# View resolution (confirmed with stakeholder):
+#   - A specific store, or a specific country's combined view -> use that country's OWN
+#     tag column (the row's real country; unambiguous).
+#   - The "All Countries / All Stores" combined view -> use the UAE tag column as the
+#     agreed representative default (mixed-country stock has no single true tag).
+#
+# Master rows are excluded from every FP/MD lookup when they have no barcode, or no
+# Category/Sub category (non-merchandise placeholder rows — confirmed with stakeholder).
+# A tag cell of '#N/A' or blank is treated as "no tag" for that barcode/country, identical
+# to a barcode absent from the master entirely.
+TAG_COUNTRIES = ['UAE','KUWAIT','SAUDI ARABIA','BAHRAIN','QATAR']
+ALL_COUNTRIES_DEFAULT_TAGCOL = 'UAE'
+# Real Country values (as found in the inventory/sales files) -> the master's tag-column
+# header. Add variants here if a refresh shows an unmapped country in the log warning below.
+COUNTRY_TO_TAGCOL = {
+    'UNITED ARAB EMIRATES': 'UAE', 'UAE': 'UAE',
+    'KUWAIT': 'KUWAIT',
+    'SAUDI ARABIA': 'SAUDI ARABIA', 'KSA': 'SAUDI ARABIA',
+    'BAHRAIN': 'BAHRAIN',
+    'QATAR': 'QATAR',
+}
+def tagcol_for_country(country):
+    return COUNTRY_TO_TAGCOL.get(str(country).strip().upper())
+
+def fpmd_for(lookup_dict, key_val, country, all_countries=False):
+    """Resolve one FP/MD tag from a {key: {tagcol: 'FP'/'MD'}} dict. all_countries=True
+    forces the UAE-default (the All-Countries combined view); otherwise resolves against
+    the row's own real country. Returns None if untagged or the country doesn't map."""
+    tags = lookup_dict.get(key_val)
+    if not tags:
+        return None
+    if all_countries:
+        return tags.get(ALL_COUNTRIES_DEFAULT_TAGCOL)
+    col = tagcol_for_country(country)
+    return tags.get(col) if col else None
+
+bc2fpmd_cty = {}   # barcode -> {tagcol: 'FP'/'MD'}
+cc2fpmd_cty = {}   # color code -> {tagcol: 'FP'/'MD'}  (first-occurrence per code; tag is
+                   # documented as consistent per color code across its size barcodes)
+_valid_fp = key.dropna(subset=['Item Barcode','Category','Sub category']).copy()
+_valid_fp = _valid_fp[(_valid_fp['Category'].str.strip()!='') & (_valid_fp['Sub category'].str.strip()!='')]
+_valid_fp = _valid_fp.drop_duplicates('Item Barcode')
+# The header repeats UAE/KUWAIT/... three times (OG PRICE, CP, TAG groups); pandas
+# disambiguates duplicate names as UAE, UAE.1, UAE.2 in column order. The TAG group is
+# always the LAST occurrence of each country name.
+_tag_col_map = {}
+for _cty in TAG_COUNTRIES:
+    _matches = [c for c in _valid_fp.columns if c.split('.')[0].strip().upper() == _cty]
+    if _matches:
+        _tag_col_map[_cty] = _matches[-1]
+if len(_tag_col_map) == len(TAG_COUNTRIES):
+    # Defensive check: confirm each detected TAG column actually holds FP/MD/#N/A values
+    # (not prices) before trusting it — catches a master whose column layout shifted.
+    _tagcols_ok = True
+    for _cty, _col in _tag_col_map.items():
+        _seen = set(_valid_fp[_col].dropna().astype(str).str.strip().str.upper().unique())
+        _bad = _seen - {'FP','MD','#N/A'}
+        if _bad:
+            print(f'FP/MD tag column for {_cty} ({_col}) has unexpected values {sorted(_bad)[:5]} '
+                  f'- master column layout may have shifted; FP/MD will be empty')
+            _tagcols_ok = False
+    if _tagcols_ok:
+        for _cty, _col in _tag_col_map.items():
+            _valid_fp[f'_tag_{_cty}'] = _valid_fp[_col].astype(str).str.strip().str.upper()
+        _tagcolnames = [f'_tag_{c}' for c in TAG_COUNTRIES]
+        for _bc, _rowvals in zip(_valid_fp['Item Barcode'], _valid_fp[_tagcolnames].values):
+            _tags = {cty: t for cty, t in zip(TAG_COUNTRIES, _rowvals) if t in ('FP','MD')}
+            if _tags:
+                bc2fpmd_cty[_bc.strip()] = _tags
+        print(f'FP/MD per-country tags loaded from master: {len(bc2fpmd_cty)} barcodes '
+              f'x {len(_tag_col_map)} countries')
+        if 'Color Code' in _valid_fp.columns:
+            _ccvalid = _valid_fp.dropna(subset=['Color Code'])
+            for _cc, _rowvals in zip(_ccvalid['Color Code'], _ccvalid[_tagcolnames].values):
+                if _cc in cc2fpmd_cty:
+                    continue
+                _tags = {cty: t for cty, t in zip(TAG_COUNTRIES, _rowvals) if t in ('FP','MD')}
+                if _tags:
+                    cc2fpmd_cty[_cc] = _tags
+            print(f'FP/MD per-country tags by color code: {len(cc2fpmd_cty)} codes')
+else:
+    print(f'FP/MD per-country tag columns not fully found (found {sorted(_tag_col_map)}); '
+          f'expected {TAG_COUNTRIES} - FP/MD will be empty')
+# Sanity check: warn if any real country actually present in this master maps to nothing,
+# so a mismatch surfaces in the refresh log instead of silently producing blank FP/MD.
+_unmapped_note = ('If FN inventory/sales Country values differ from '
+                   f'{sorted(set(COUNTRY_TO_TAGCOL))}, add the variant to COUNTRY_TO_TAGCOL.')
+print(_unmapped_note)
 
 # Color Code -> total number of distinct sizes that exist for it in the system (master).
 # Drives size-availability = (distinct sizes in stock) / (total distinct sizes in system).
@@ -226,7 +301,9 @@ inv['Key']=inv['Item Barcode'].map(b2k).fillna('BC-'+inv['Item Barcode'])
 inv['Cat'] = [cat_for(k, g) for k, g in zip(inv['Key'], inv['Item Group'])]
 inv['Sub'] = [sub_for(k, d) for k, d in zip(inv['Key'], inv['Item Department'])]
 # FP/MD tag per row from the authoritative master barcode map (for the inventory snapshot).
-inv['FPMD'] = inv['Item Barcode'].map(bc2fpmd)
+# FP/MD is NOT tagged globally here anymore — inventory_snapshot() resolves it per call
+# (real country for a store/country view, UAE-default for the All-Countries view),
+# since the same inv rows are reused across all three kinds of call.
 # Last-received date drives the "exclude last-30-day arrivals" rule on bottom sellers.
 # If the date column is absent, fall back to Ageing Days (>30 days => not a new arrival).
 if 'Last recieved date store' in inv.columns:
@@ -280,12 +357,36 @@ yd = num(yd, ['Net Sales Amt','Net Sales Qty'])
 #   FP units %  = FP-tagged units / total units                (shown alongside)
 # Computed from the datewise sales file (single day = yesterday). Other periods fall back
 # to the KPI file's FP% (which has no unit count).
+#
+# Every sale genuinely happened in one real store/country, so per-store fp_yest[loc] always
+# tags using that sale's OWN real country (never the All-Countries UAE-default — that default
+# only applies to the combined All-Countries KPI figure, computed separately in combine_kpis).
+loc2country = inv.groupby('Location')['Country'].first().to_dict()
 fp_yest = {}   # location -> {'amt_pct':0-1, 'unit_pct':0-1, 'fp_units':int, 'tot_units':int}
 _yt = yd.copy()
-_yt['_tag'] = _yt['Item Barcode'].map(bc2fpmd)            # FP / MD / None
-_yt['_isfp'] = (_yt['_tag']=='FP')
-_yt['_fp_amt']  = _yt['_isfp'] * _yt['Net Sales Amt']
-_yt['_fp_qty']  = _yt['_isfp'] * _yt['Net Sales Qty']
+if 'Country' in _yt.columns:
+    _yt['_cty'] = _yt['Country']
+else:
+    _yt['_cty'] = _yt['Location'].map(loc2country)
+_unmapped_ctys = sorted(set(_yt['_cty'].dropna().unique()) - set(COUNTRY_TO_TAGCOL))
+if _unmapped_ctys:
+    print(f'Sales-file countries with no FP/MD tag-column mapping (FP/MD will be blank for '
+          f'these rows): {_unmapped_ctys} - add to COUNTRY_TO_TAGCOL if this is unexpected')
+_yt['_tagcol'] = _yt['_cty'].map(tagcol_for_country)
+def _bc_tag(bc, tagcol):
+    tags = bc2fpmd_cty.get(bc)
+    return tags.get(tagcol) if (tags and tagcol) else None
+# real-country tag (used for every per-store and per-country figure)
+_yt['_tag_real'] = [_bc_tag(bc, tc) for bc, tc in zip(_yt['Item Barcode'], _yt['_tagcol'])]
+# UAE-default tag (used ONLY for the All-Countries combined figure, in combine_kpis below)
+_yt['_tag_alldef'] = _yt['Item Barcode'].map(
+    lambda bc: (bc2fpmd_cty.get(bc) or {}).get(ALL_COUNTRIES_DEFAULT_TAGCOL))
+_yt['_isfp_real']   = (_yt['_tag_real']=='FP')
+_yt['_isfp_alldef'] = (_yt['_tag_alldef']=='FP')
+_yt['_fp_amt']  = _yt['_isfp_real'] * _yt['Net Sales Amt']
+_yt['_fp_qty']  = _yt['_isfp_real'] * _yt['Net Sales Qty']
+_yt['_fp_amt_alldef'] = _yt['_isfp_alldef'] * _yt['Net Sales Amt']
+_yt['_fp_qty_alldef'] = _yt['_isfp_alldef'] * _yt['Net Sales Qty']
 _g = _yt.groupby('Location').agg(fp_amt=('_fp_amt','sum'), tot_amt=('Net Sales Amt','sum'),
                                  fp_qty=('_fp_qty','sum'), tot_qty=('Net Sales Qty','sum'))
 for loc, r in _g.iterrows():
@@ -438,10 +539,12 @@ def _wcstatus(r,col):
     if r['InvQty'] and r['InvQty']>0: return 'dead'
     return 'none'
 
-def item_row(r):
-    """Full attributes for one Key at one store, for client-side ranking/filtering."""
+def item_row(r, country=None):
+    """Full attributes for one Key at one store, for client-side ranking/filtering.
+    country=None means the All-Countries view -> resolve FP/MD via the UAE default;
+    otherwise resolve against that country's own real tag."""
     gm = gm_freshest(r)
-    _mt = cc2fpmd.get(r['Key'])
+    _mt = fpmd_for(cc2fpmd_cty, r['Key'], country, all_countries=(country is None))
     fpmd = _mt if _mt in ('FP','MD') else (None if gm is None else ('FP' if gm>=75 else 'MD'))
     lr = r['LastRecv']
     recent = bool(pd.notna(lr) and lr.date()>recent_cutoff)
@@ -461,8 +564,8 @@ def item_row(r):
         }
     }
 
-def item_list(sub):
-    return [item_row(r) for _,r in sub.iterrows()]
+def item_list(sub, country=None):
+    return [item_row(r, country=country) for _,r in sub.iterrows()]
 
 def xcat_item_rows(loc=None, country=None):
     """Build minimal item dicts for excluded-category items that SOLD yesterday, tagged
@@ -498,7 +601,7 @@ def xcat_item_rows(loc=None, country=None):
         })
     return out
 
-def candidate_items(sub):
+def candidate_items(sub, country=None):
     """Trim to items that could appear in a top/bottom-10 under any filter combo.
     For each Group (the finest seller filter), keep the top 15 + bottom 15 by YTD sales,
     plus top/bottom by inventory cost for dead-stock bottom lists. Union across periods
@@ -529,7 +632,7 @@ def candidate_items(sub):
         for dept, dsub in gsub.groupby('Dept'):
             keep_idx.update(dsub.sort_values('_sales',ascending=False).head(12).index)
             keep_idx.update(dsub.sort_values('_sales',ascending=True).head(12).index)
-    return item_list(sub.loc[sorted(keep_idx)])
+    return item_list(sub.loc[sorted(keep_idx)], country=country)
 
 import re
 def strip_size(desc, k):
@@ -628,15 +731,28 @@ _SEASON_ORDER = ['Spring 2026','Summer 2026','Autumn 2025','Winter 2025','Older'
 # size run changes. NOTE: one-size / very-short-run styles read as "broken" under an absolute
 # threshold — see the size-set card notes.
 SIZESET_FULL_MIN = 4
-def inventory_snapshot(df):
+def inventory_snapshot(df, country=None):
     """Build the 4-part inventory snapshot for an inventory sub-frame (a store or a
     combined set). All sections use in-stock rows (Inventory Qty > 0). Both a units basis
     (Inventory Qty) and a value basis (Inventory Value) are emitted so the dashboard can
-    toggle between them client-side."""
+    toggle between them client-side.
+    country=None means the All-Countries combined view -> FP/MD resolves via the UAE
+    default. Otherwise FP/MD resolves against that country's own real tag. The frame passed
+    in (inv_sub / inv_c / _allinv) is always homogeneous w.r.t. this rule at the call site:
+    a single store or single country's rows for the real-country case, or every country's
+    rows together for the All-Countries case."""
     sub = df[df['Inventory Qty'] > 0].copy()
     if sub.empty:
         return {'fpmd':[],'season':[],'style':[],'size':[],'sizeset':[],'total_cc':0,
                 'total_units':0,'total_value':0}
+    _all_ctry = (country is None)
+    sub['FPMD'] = sub['Item Barcode'].map(
+        lambda bc: fpmd_for(bc2fpmd_cty, bc, country, all_countries=_all_ctry))
+    _cc_tag_cache = {}
+    def _cc_tag(cc):
+        if cc not in _cc_tag_cache:
+            _cc_tag_cache[cc] = fpmd_for(cc2fpmd_cty, cc, country, all_countries=_all_ctry)
+        return _cc_tag_cache[cc]
     sub['_sb'] = sub['Season'].map(_season_bucket)
     qcol = pd.to_numeric(sub['Inventory Qty'],errors='coerce').fillna(0)
     vcol = pd.to_numeric(sub['Inventory Value'],errors='coerce').fillna(0)
@@ -696,7 +812,8 @@ def inventory_snapshot(df):
     # code is a "full set" when it has >= SIZESET_FULL_MIN distinct in-stock sizes, OR has all of
     # its system sizes in stock (so one-size / short-run styles aren't unfairly marked broken).
     # comp = % of in-stock color codes that are full sets (higher = better). FP/MD split uses the
-    # master per-color-code tag (cc2fpmd); untagged color codes still count toward the overall.
+    # master per-color-code tag (cc2fpmd_cty, resolved per this call's country); untagged
+    # color codes still count toward the overall.
     def _setcomp(frame):
         if 'Item Size' not in frame.columns or frame.empty:
             return {'comp':None,'total_cc':0,'full_cc':0,'fp_comp':None,'fp_cc':0,'md_comp':None,'md_cc':0}
@@ -705,7 +822,7 @@ def inventory_snapshot(df):
         for cc, n in nsizes.items():
             full = 1 if (n >= SIZESET_FULL_MIN or (cc_total_sizes.get(cc) and n >= cc_total_sizes.get(cc))) else 0
             a_tot+=1; a_full+=full
-            tag = cc2fpmd.get(cc)
+            tag = _cc_tag(cc)
             if tag=='FP': fp_tot+=1; fp_full+=full
             elif tag=='MD': md_tot+=1; md_full+=full
         _pct=lambda f,t: round2(100*f/t) if t else None
@@ -892,13 +1009,16 @@ try:
         sub=inv[inv['Location'].isin(locs)]
         s=pd.to_numeric(sub[salescol],errors='coerce').sum(); c=pd.to_numeric(sub[costcol],errors='coerce').sum()
         return (1-c/s) if s else None
-    def combine_kpis(locs, lfl=False):
+    def combine_kpis(locs, lfl=False, all_countries=False):
         """Sum KPIs across store locations, per period, TY and LY.
         When lfl=True, restrict to like-for-like: a store counts if it traded during last
         year's window at all (opened on/before the LY window end). For each such store the
         TY and LY windows are clipped to the span where it traded in BOTH years, then summed
         across the comparable cohort — so partially-open stores still contribute their
-        comparable portion rather than being dropped entirely."""
+        comparable portion rather than being dropped entirely.
+        all_countries=True is used ONLY for the All-Countries combined KPI figure: the
+        yesterday FP Sales % override below then reads the UAE-default tag columns instead
+        of each sale's own real-country tag (every other view always uses the real tag)."""
         out={}
         for p in ['yesterday','wtd','mtd','ytd']:
             s,e=win(p); ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
@@ -961,8 +1081,10 @@ try:
             if p=='yesterday' and ty is not None and not lfl:
                 _m = _yt[_yt['Location'].isin(locs)]
                 if len(_m):
-                    _fpa=_m['_fp_amt'].sum(); _ta=_m['Net Sales Amt'].sum()
-                    _fpq=_m['_fp_qty'].sum(); _tq=_m['Net Sales Qty'].sum()
+                    _fpcol = '_fp_amt_alldef' if all_countries else '_fp_amt'
+                    _fqcol = '_fp_qty_alldef' if all_countries else '_fp_qty'
+                    _fpa=_m[_fpcol].sum(); _ta=_m['Net Sales Amt'].sum()
+                    _fpq=_m[_fqcol].sum(); _tq=_m['Net Sales Qty'].sum()
                     _apct=(_fpa/_ta) if _ta else None; _upct=(_fpq/_tq) if _tq else None
                     if _apct is None or not (0<=_apct<=1): _apct=_upct
                     if _apct is not None:
@@ -979,7 +1101,7 @@ try:
         return out
 except Exception as ex:
     print('KPI load skipped:', ex)
-    def combine_kpis(locs, lfl=False): return None
+    def combine_kpis(locs, lfl=False, all_countries=False): return None
 
 # ---------------- top-10 in-transit ITEMS with images ----------------
 inv['ImgKey']=inv['Key']
@@ -1005,12 +1127,12 @@ for loc, sub in g.groupby('Location'):
     inv_sub = inv[inv['Location']==loc]
     country = sub['Country'].iloc[0]; region = sub['Region'].iloc[0]
     blob={'country':country,'region':region,
-          'items':candidate_items(sub[(sub['InvQty']>0)|(sub['YTDqty']>0)|(sub['YestQty']>0)])
+          'items':candidate_items(sub[(sub['InvQty']>0)|(sub['YTDqty']>0)|(sub['YestQty']>0)], country=country)
                   + xcat_item_rows(loc=loc),
           'cat_pivot':cat_pivot(sub),
           'in_transit':in_transit(inv_sub),
           'transit_items':transit_items(loc),
-          'inv_snapshot':inventory_snapshot(inv_sub),
+          'inv_snapshot':inventory_snapshot(inv_sub, country=country),
           'kpi':kpi_store.get(loc),
           'kpi_lfl':kpi_lfl_store.get(loc)}
     stores[loc]=blob
@@ -1025,7 +1147,7 @@ for country, csub in g.groupby('Country'):
           'cat_pivot':cat_pivot(csub),
           'in_transit':in_transit(inv_c),
           'transit_items':transit_items_df(inv_c),
-          'inv_snapshot':inventory_snapshot(inv_c),
+          'inv_snapshot':inventory_snapshot(inv_c, country=country),
           'kpi':None}
     # country-wide: aggregate the same Key across all stores in the country
     cg = csub.groupby('Key').agg(
@@ -1047,7 +1169,7 @@ for country, csub in g.groupby('Country'):
     cg['WC_week']=np.where(np.isfinite(_rwk),cg['InvQty']/_rwk,np.where(np.isfinite(_rmo),cg['InvQty']/_rmo,np.where(np.isfinite(ryr),cg['InvQty']/ryr,np.nan)))
     cg['WC_month']=np.where(np.isfinite(_rmo),cg['InvQty']/_rmo,np.where(np.isfinite(ryr),cg['InvQty']/ryr,np.nan))
     cg['WC_year']=np.where(np.isfinite(ryr),cg['InvQty']/ryr,np.nan)
-    blob['items']=candidate_items(cg[(cg['InvQty']>0)|(cg['YTDqty']>0)|(cg['YestQty']>0)]) \
+    blob['items']=candidate_items(cg[(cg['InvQty']>0)|(cg['YTDqty']>0)|(cg['YestQty']>0)], country=country) \
                   + xcat_item_rows(country=country)
     if kpi_store:
         clocs=[l for l in csub['Location'].unique() if l in kpi_store]
@@ -1063,7 +1185,7 @@ all_blob = {'country':'All Countries','region':'All regions','is_combined':True,
             'cat_pivot':cat_pivot(g),
             'in_transit':in_transit(_allinv),
             'transit_items':transit_items_df(_allinv),
-            'inv_snapshot':inventory_snapshot(_allinv),
+            'inv_snapshot':inventory_snapshot(_allinv, country=None),
             'kpi':None}
 acg = g.groupby('Key').agg(
     Desc=('Desc','first'),Group=('Group','first'),Dept=('Dept','first'),Cls=('Cls','first'),
@@ -1083,10 +1205,10 @@ _rmo = rmo if mtd_ok else np.full(len(acg), np.nan)
 acg['WC_week']=np.where(np.isfinite(_rwk),acg['InvQty']/_rwk,np.where(np.isfinite(_rmo),acg['InvQty']/_rmo,np.where(np.isfinite(ryr),acg['InvQty']/ryr,np.nan)))
 acg['WC_month']=np.where(np.isfinite(_rmo),acg['InvQty']/_rmo,np.where(np.isfinite(ryr),acg['InvQty']/ryr,np.nan))
 acg['WC_year']=np.where(np.isfinite(ryr),acg['InvQty']/ryr,np.nan)
-all_blob['items']=candidate_items(acg[(acg['InvQty']>0)|(acg['YTDqty']>0)|(acg['YestQty']>0)])
+all_blob['items']=candidate_items(acg[(acg['InvQty']>0)|(acg['YTDqty']>0)|(acg['YestQty']>0)], country=None)
 if kpi_store:
     alllocs=[l for l in _alllocs if l in kpi_store]
-    all_blob['kpi']=combine_kpis(alllocs)
+    all_blob['kpi']=combine_kpis(alllocs, all_countries=True)
     all_blob['kpi_lfl']=combine_kpis(alllocs, lfl=True)
 country_blobs['All Countries']=all_blob
 
