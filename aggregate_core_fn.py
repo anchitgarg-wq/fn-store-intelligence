@@ -211,6 +211,57 @@ try:
 except Exception as ex:
     print('Budget tab not loaded:', ex)
 
+# ---------------- KPI Targets tab (store x date daily operational targets) ----------------
+# Daily per-store targets for ASP, Sales Qty, Conversion Rate, Footfall, Invoices
+# (transactions), UPT, ATV (=AOV), and optionally GP% / FP Sales% (may be blank/absent
+# until populated). Sales Amount's own target keeps coming from the Budget tab above,
+# unchanged — this sheet covers the OTHER KPI tiles.
+# Additive components (qty, footfall, invoices, and a derived per-day "target revenue" =
+# ATV Targ x Target Invoice) are banked per day; ratio targets (ASP/CR/UPT/AOV/GP/FP) for
+# any period are RE-DERIVED from the summed components, never averaged day-by-day — same
+# "totals, not averages of daily ratios" principle agg_window() already uses for actuals.
+kpi_target_daily = {}   # normalised store name -> {date: {qty,foot,inv,rev,gp,fp}}
+try:
+    kt = pd.read_excel(U+'FN_Color_Code_Master.xlsx', sheet_name='KPI Targets')
+    kt.columns=[c.strip() for c in kt.columns]
+    kt['Date']=pd.to_datetime(kt['Date'],errors='coerce')
+    _loc_col = 'Location' if 'Location' in kt.columns else kt.columns[2]
+    kt['_loc']=kt[_loc_col].map(norm_store)
+    for c in ['Target Sales Qty','CR targ','Target Footfall','Target Invoice','UPT Targ','ATV tar','ASP Targ']:
+        if c in kt.columns: kt[c]=pd.to_numeric(kt[c],errors='coerce')
+    # GP% / FP Sales% are optional — either column may be entirely absent (not yet added
+    # to the sheet) or present but fully blank (added as a placeholder, not yet populated).
+    # Auto-detect 0-1 vs 0-100 scale the same way the KPI file's percent columns are read.
+    def _pct_col(colnames):
+        for cn in colnames:
+            if cn in kt.columns:
+                v = pd.to_numeric(kt[cn], errors='coerce')
+                _med = v.dropna().median()
+                if pd.notna(_med) and _med > 1.5: v = v/100.0
+                return v
+        return pd.Series([None]*len(kt))
+    kt['_gp']  = _pct_col(['GP%','GP %'])
+    kt['_fp']  = _pct_col(['FP Sales%','FP Sales %','FP%','FP %'])
+    kt['_rev'] = kt['ATV tar'] * kt['Target Invoice']   # derived per-day target revenue
+    def _num(v):
+        return float(v) if pd.notna(v) else 0.0
+    for _, r in kt.dropna(subset=['Date','_loc']).iterrows():
+        d = kpi_target_daily.setdefault(r['_loc'], {})
+        dte = r['Date'].date()
+        d[dte] = {
+            'qty':  _num(r.get('Target Sales Qty')),
+            'foot': _num(r.get('Target Footfall')),
+            'inv':  _num(r.get('Target Invoice')),
+            'rev':  _num(r.get('_rev')),
+            'gp':   (float(r['_gp']) if pd.notna(r.get('_gp')) else None),
+            'fp':   (float(r['_fp']) if pd.notna(r.get('_fp')) else None),
+        }
+    _has_gp = kt['_gp'].notna().any() if '_gp' in kt.columns else False
+    _has_fp = kt['_fp'].notna().any() if '_fp' in kt.columns else False
+    print(f'KPI Targets loaded: {len(kpi_target_daily)} stores | GP% populated: {bool(_has_gp)} | FP Sales% populated: {bool(_has_fp)}')
+except Exception as ex:
+    print('KPI Targets tab not loaded:', ex)
+
 # ---------------- LFL Dates tab (store opening dates) ----------------
 # Like-for-like: a store is "comparable" for a period only if it was open for the ENTIRE
 # corresponding period one year earlier (open on/before the LY window start). Used by the
@@ -922,6 +973,57 @@ try:
                 if s<=dte<=e and val==val:
                     tot+=val; found=True
         return tot if found else None
+    def sum_kpi_targets(locs, s, e):
+        """Sum daily KPI-target components over [s,e] for a store or list of stores, then
+        derive period ratio targets from the SUMMED totals — never an average of daily
+        ratio values (same principle as agg_window's actuals). Returns None if no target
+        rows exist in the window for any of the stores."""
+        if isinstance(locs, str): locs=[locs]
+        qty=foot=inv=rev=0.0
+        gp_rev=gp_w=0.0; fp_rev=fp_w=0.0
+        found=False
+        for loc in locs:
+            days = kpi_target_daily.get(loc)
+            if not days: continue
+            for dte, d in days.items():
+                if not (s<=dte<=e): continue
+                found=True
+                qty+=d['qty']; foot+=d['foot']; inv+=d['inv']; rev+=d['rev']
+                if d['gp'] is not None:
+                    gp_rev+=d['rev']; gp_w+=d['gp']*d['rev']
+                if d['fp'] is not None:
+                    fp_rev+=d['rev']; fp_w+=d['fp']*d['rev']
+        if not found: return None
+        return {
+            'qty':qty, 'foot':foot, 'inv':inv, 'rev':rev,
+            'asp':  (rev/qty) if qty else None,
+            'cr':   (inv/foot) if foot else None,
+            'upt':  (qty/inv) if inv else None,
+            'aov':  (rev/inv) if inv else None,
+            'gp':   (gp_w/gp_rev) if gp_rev else None,
+            'fp':   (fp_w/fp_rev) if fp_rev else None,
+        }
+    def _attach_kpi_targets(ty, _kt):
+        """Attach target_<metric> and target_<metric>_pct fields onto a ty dict from a
+        sum_kpi_targets() result. Only sets a field when its target is actually available,
+        so a metric with no target data (e.g. GP%/FP% before they're populated) simply has
+        no target_ key and the dashboard hides that comparison automatically — no code
+        change needed once the sheet is filled in."""
+        if not _kt: return
+        pairs = [('qty','target_qty'), ('foot','target_footfall'), ('cr','target_conv'),
+                 ('upt','target_upt'), ('aov','target_aov'), ('asp','target_asp'),
+                 ('gp','target_gp'), ('fp','target_fp')]
+        actual_key = {'qty':'qty','foot':'footfall','cr':'conv','upt':'upt','aov':'aov',
+                      'asp':'asp','gp':'gp','fp':'fullprice'}
+        for src, dst in pairs:
+            v = _kt.get(src)
+            if v is None: continue
+            is_pct = src in ('cr','gp','fp')
+            tv = round2(v*100) if is_pct else round2(v)
+            ty[dst] = tv
+            av = ty.get(actual_key[src])
+            if av is not None and tv:
+                ty[dst+'_pct'] = round2(av/tv*100)
     def agg_window(sub, s, e):
         m = (sub['Date'].dt.date>=s) & (sub['Date'].dt.date<=e)
         w = sub[m]
@@ -977,6 +1079,10 @@ try:
                 _bt = sum_budget(loc, s, e)
                 ty['budget'] = round2(_bt) if _bt else None
                 ty['budget_pct'] = round2(ty['sales']/_bt*100) if (_bt and ty.get('sales') is not None) else None
+                # KPI Targets (Sales Qty / Footfall / Conversion / UPT / AOV / ASP, plus
+                # GP% / FP% once populated). Sales Amount's own target is the Budget line
+                # above — unrelated to this block, which covers the other metrics.
+                _attach_kpi_targets(ty, sum_kpi_targets(loc, s, e))
             per[p]={'ty':ty,'ly':ly}
         kpi_store[loc]=per
         # Store-level like-for-like. A naive LY comparison is unfair for a store that opened
@@ -1101,6 +1207,7 @@ try:
                 _bt=sum_budget(locs,s,e)
                 ty['budget']=round2(_bt) if _bt else None
                 ty['budget_pct']=round2(ty['sales']/_bt*100) if (_bt and ty.get('sales') is not None) else None
+                _attach_kpi_targets(ty, sum_kpi_targets(locs, s, e))
             blob_extra={'lfl_stores':len(mem)} if lfl else {}
             out[p]={'ty':ty,'ly':ly, **blob_extra}
         return out
