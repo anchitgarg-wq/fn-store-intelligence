@@ -59,7 +59,12 @@ def norm_store(loc):
 
 # ---------------- barcode -> Color Code (FN's "key") ----------------
 # Forever New rolls up at COLOR CODE level (style-colour), the analogue of SM's NEW Key.
-key = pd.read_excel(U+'FN_Color_Code_Master.xlsx', dtype=str); key.columns=[c.strip() for c in key.columns]
+# NOTE: FN_Color_Code_Master.xlsx (2026 format) has TWO header rows: row 1 is a merged
+# group label ('OG PRICE'/'CP'/'TAG' repeated over each country), row 2 has the real
+# column names ('Item Barcode', 'Color Code', ... 'UAE', 'KUWAIT', ...). header=1 skips
+# the group-label row so pandas reads the real names. Without this, pandas reads the
+# group-label row as headers and every column lookup below fails with a KeyError.
+key = pd.read_excel(U+'FN_Color_Code_Master.xlsx', dtype=str, header=1); key.columns=[c.strip() for c in key.columns]
 key['Item Barcode']=key['Item Barcode'].str.strip()
 b2k = key.dropna(subset=['Color Code']).drop_duplicates('Item Barcode').set_index('Item Barcode')['Color Code'].to_dict()
 
