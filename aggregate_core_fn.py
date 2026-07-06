@@ -1215,6 +1215,65 @@ except Exception as ex:
     print('KPI load skipped:', ex)
     def combine_kpis(locs, lfl=False, all_countries=False): return None
 
+# ---------------- ECOM sales KPI (Forever New ecom report, dated) ----------------
+# Drives two Stores-view tiles: ECOM Sales and Share of Business. Dated per Day Date, so it
+# responds to the Yesterday/WTD/MTD/YTD period selector, and (spanning last year) yields an
+# LY delta. Aggregated per Shipping Country + an All-Countries roll-up. The FN report is
+# Forever New only, so no brand filter is applied. Source: newest FN_Ecom_Sales_*.xlsx
+# dropped by the Zap; if absent, the tiles simply show "accruing"/"—".
+ecom_kpi = {}
+try:
+    ECOM_FILE = _newest('FN_Ecom_Sales_*.xlsx')
+    print('Using ecom   :', os.path.basename(ECOM_FILE))
+    # Title row + blank row precede the real header, so detect the header row ('Order No').
+    _probe = pd.read_excel(ECOM_FILE, sheet_name=0, header=None, nrows=8)
+    _hrow = 0
+    for _i in range(len(_probe)):
+        if (_probe.iloc[_i].astype(str).str.strip() == 'Order No').any():
+            _hrow = _i; break
+    edf = pd.read_excel(ECOM_FILE, sheet_name=0, header=_hrow)
+    edf.columns=[str(c).strip() for c in edf.columns]
+    edf['_date']=pd.to_datetime(edf['Day Date'],errors='coerce')
+    edf['_country']=edf['Shipping Country'].astype(str).str.strip()
+    for _c in ['Net Sales','Ordered Qty','Cost Amount','No of orders']:
+        edf[_c]=pd.to_numeric(edf.get(_c),errors='coerce')
+    edf=edf.dropna(subset=['_date'])
+    # Anchor windows to the ecom report's own latest date (capped at AS_OF).
+    _edates=edf['_date'].dt.date
+    ECOM_ASOF=min(AS_OF, _edates.max()) if len(_edates) else AS_OF
+    def _ewin(period):
+        if period=='yesterday': return ECOM_ASOF, ECOM_ASOF
+        if period=='wtd': return ECOM_ASOF - dt.timedelta(days=ECOM_ASOF.weekday()), ECOM_ASOF
+        if period=='mtd': return ECOM_ASOF.replace(day=1), ECOM_ASOF
+        return ECOM_ASOF.replace(month=1, day=1), ECOM_ASOF
+    def _eagg(sub, s, e):
+        w=sub[(sub['_date'].dt.date>=s)&(sub['_date'].dt.date<=e)]
+        if w.empty: return None
+        sales=w['Net Sales'].sum(); qty=w['Ordered Qty'].sum()
+        cost=w['Cost Amount'].sum(); orders=w['No of orders'].sum()
+        return {'sales':round2(sales),'qty':round2(qty),
+                'gp':round2((1-cost/sales)*100) if (sales and sales!=0) else None,
+                'orders':round2(orders)}
+    def _ebuild(sub):
+        out={}
+        for p in ['yesterday','wtd','mtd','ytd']:
+            s,e=_ewin(p)
+            try: ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
+            except ValueError: ls,le=s.replace(year=s.year-1,day=28), e.replace(year=e.year-1)
+            out[p]={'ty':_eagg(sub,s,e),'ly':_eagg(sub,ls,le)}
+        return out
+    for _c,_csub in edf.groupby('_country'):
+        ecom_kpi[_c]=_ebuild(_csub)
+    ecom_kpi['All Countries']=_ebuild(edf)
+    _ec=sorted([c for c in ecom_kpi if c!='All Countries'])
+    print('Ecom KPI loaded: %d rows | countries=%s | ecom as-of %s' % (len(edf), _ec, ECOM_ASOF))
+except FileNotFoundError:
+    print('Ecom sales report not present (FN_Ecom_Sales_*.xlsx) - ECOM tiles will show as accruing.')
+    ecom_kpi={}
+except Exception as ex:
+    print('Ecom KPI load skipped:', ex)
+    ecom_kpi={}
+
 # ---------------- top-10 in-transit ITEMS with images ----------------
 inv['ImgKey']=inv['Key']
 it_all = inv[inv['In Transit Qty']>0].copy()
@@ -1487,6 +1546,7 @@ summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
          'store_country':store_country,
          'country_blobs':country_blobs,
          'country_perf':country_perf,
+         'ecom_kpi':ecom_kpi,
          'weekly':weekly,
          'stores':stores}
 
