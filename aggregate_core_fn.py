@@ -78,6 +78,24 @@ if 'UAE' in key.columns:
     og_uae = {bc: v for bc, v in zip(key['Item Barcode'], _oguae) if pd.notna(v)}
 print('UAE OG price loaded for %d barcodes' % len(og_uae))
 
+# ---- WH/DC locations from the StoreDc Master tab (Location Type == 'WH') ----
+# Used for warehouse-stock visibility. Matched to inventory Locations by a whitespace-
+# collapsed, upper-cased key so minor formatting differences don't break the join.
+def _canon(x): return ' '.join(str(x).split()).upper()
+wh_locs = set()
+try:
+    _sd = pd.read_excel(U+'FN_Color_Code_Master.xlsx', sheet_name='StoreDc Master')
+    _sd.columns=[str(c).strip() for c in _sd.columns]
+    _nmc = next((c for c in _sd.columns if c.strip().lower() in ('store name','location','name')), _sd.columns[0])
+    _tyc = next((c for c in _sd.columns if c.strip().lower()=='location type'), None)
+    if _tyc is not None:
+        for _n,_t in zip(_sd[_nmc], _sd[_tyc]):
+            if pd.notna(_n) and str(_t).strip().upper()=='WH':
+                wh_locs.add(_canon(_n))
+    print('WH/DC locations from StoreDc Master: %d' % len(wh_locs))
+except Exception as ex:
+    print('StoreDc Master tab not read (WH stock disabled):', ex)
+
 # Color Code -> clean display name. FN master has Item Description + Item Color; build
 # "Description · Colour" (size-free), falling back to inventory Item Description downstream.
 def clean_name(sn, col):
@@ -392,6 +410,8 @@ def is_physical(loc):
     return True
 
 inv['Location'] = inv['Location'].map(norm_store)
+# Capture WH/DC rows BEFORE the physical-store filter removes them (merchandise filter applied below).
+_whinv = inv[inv['Location'].map(lambda l: _canon(l) in wh_locs)].copy()
 inv = inv[inv['Location'].map(is_physical)].copy()
 # Scope to core merchandise. FN is apparel: exclude only NON MERCHANDISE and SHOPPING BAGS
 # (hangers, garment/jewellery bags, packaging). Everything else (womens-wear depts,
@@ -400,6 +420,17 @@ EXCL_GROUPS = {'NON MERCHANDISE','NON-MERCHANDISE'}
 EXCL_DEPTS  = {'NON MERCHANDISE','NON-MERCHANDISE','SHOPPING BAGS'}
 inv = inv[~inv['Item Group'].str.upper().isin(EXCL_GROUPS)]
 inv = inv[~inv['Item Department'].str.upper().isin(EXCL_DEPTS)].copy()
+# WH stock = merchandise only (same exclusion), aggregated by country and by (country, color code).
+if len(_whinv):
+    _whinv = _whinv[~_whinv['Item Group'].astype(str).str.upper().isin(EXCL_GROUPS)]
+    _whinv = _whinv[~_whinv['Item Department'].astype(str).str.upper().isin(EXCL_DEPTS)].copy()
+    _whinv['_wq'] = pd.to_numeric(_whinv['Inventory Qty'], errors='coerce').fillna(0)
+    wh_country_qty = _whinv.groupby('Country')['_wq'].sum().to_dict()
+    wh_cc_qty = _whinv.groupby(['Country','Key'])['_wq'].sum().to_dict()   # (country, colorcode) -> qty
+    wh_total_qty = float(_whinv['_wq'].sum())
+    print('WH stock (merchandise): total=%d | countries=%s' % (int(wh_total_qty), sorted(wh_country_qty)))
+else:
+    wh_country_qty = {}; wh_cc_qty = {}; wh_total_qty = 0.0
 gc.collect()  # free the pre-filter frame's memory before heavy aggregation
 inv = num(inv, ['Unit Cost','Net Sales Amt (WTD)','Net Sales Qty (WTD)','Cost Amt (WTD)',
                 'Net Sales Amt (MTD)','Net Sales Qty (MTD)','Cost Amt (MTD)',
@@ -594,6 +625,24 @@ gp_kpi = {}
 for _loc,_sub in g.groupby('Location'): gp_kpi[_loc]=_gp_scope(_sub)
 for _cty,_sub in g.groupby('Country'): gp_kpi[_cty]=_gp_scope(_sub)
 gp_kpi['All Countries']=_gp_scope(g)
+
+# ---- WH stock KPI: warehouse/DC qty for the current scope (current snapshot, not per-period) ----
+# Country / All Countries -> that country's (or all) merchandise WH qty.
+# Single store -> the store's country DC qty, restricted to the color codes the store holds.
+def _r0(x):
+    try: return int(round(float(x)))
+    except: return None
+wh_kpi = {'All Countries': _r0(wh_total_qty)}
+for _cty,_q in wh_country_qty.items():
+    wh_kpi[_cty] = _r0(_q)
+if wh_cc_qty:
+    for _loc,_sub in g.groupby('Location'):
+        _cty = _sub['Country'].iloc[0] if len(_sub) else None
+        _held = set(_sub[_sub['InvQty']>0]['Key'])
+        _t = 0.0
+        for _k in _held:
+            _t += wh_cc_qty.get((_cty,_k), 0.0)
+        wh_kpi[_loc] = _r0(_t)
 
 # ---- per-period weeks-cover with cascade (selected period -> next -> next) ----
 # weekly rate from a period: (qty / days_elapsed_in_period) * 7
@@ -863,6 +912,14 @@ _SEASON_ORDER = ['Spring 2026','Summer 2026','Autumn 2025','Winter 2025','Older'
 # this many DISTINCT in-stock sizes; fewer (1..N-1) is "broken". Tune here if the apparel
 # size run changes. NOTE: one-size / very-short-run styles read as "broken" under an absolute
 # threshold — see the size-set card notes.
+import re as _re
+_CORE_SET = {8,10,12,14,16}
+def _core_size(s):
+    m = _re.search(r'size\s*(\d+)', str(s), _re.I)
+    if m:
+        n = int(m.group(1))
+        if n in _CORE_SET: return n
+    return None
 SIZESET_FULL_MIN = 4
 def inventory_snapshot(df, country=None):
     """Build the 4-part inventory snapshot for an inventory sub-frame (a store or a
@@ -949,19 +1006,26 @@ def inventory_snapshot(df, country=None):
     # color codes still count toward the overall.
     def _setcomp(frame):
         if 'Item Size' not in frame.columns or frame.empty:
-            return {'comp':None,'total_cc':0,'full_cc':0,'fp_comp':None,'fp_cc':0,'md_comp':None,'md_cc':0}
+            return {'comp':None,'total_cc':0,'full_cc':0,'fp_comp':None,'fp_cc':0,'md_comp':None,'md_cc':0,
+                    'comp2':None,'fp_comp2':None,'md_comp2':None}
         nsizes = frame.groupby('Key')['Item Size'].nunique()
+        # alt logic: count of DISTINCT in-stock CORE sizes (8,10,12,14,16) per color code
+        core_cnt = frame.groupby('Key')['Item Size'].apply(
+            lambda s: len({_core_size(x) for x in s} - {None}))
         a_full=a_tot=fp_full=fp_tot=md_full=md_tot=0
+        b_full=bfp_full=bmd_full=0
         for cc, n in nsizes.items():
             full = 1 if (n >= SIZESET_FULL_MIN or (cc_total_sizes.get(cc) and n >= cc_total_sizes.get(cc))) else 0
-            a_tot+=1; a_full+=full
+            full_b = 1 if core_cnt.get(cc,0) >= 3 else 0
+            a_tot+=1; a_full+=full; b_full+=full_b
             tag = _cc_tag(cc)
-            if tag=='FP': fp_tot+=1; fp_full+=full
-            elif tag=='MD': md_tot+=1; md_full+=full
+            if tag=='FP': fp_tot+=1; fp_full+=full; bfp_full+=full_b
+            elif tag=='MD': md_tot+=1; md_full+=full; bmd_full+=full_b
         _pct=lambda f,t: round2(100*f/t) if t else None
         return {'comp':_pct(a_full,a_tot),'total_cc':int(a_tot),'full_cc':int(a_full),
                 'fp_comp':_pct(fp_full,fp_tot),'fp_cc':int(fp_tot),
-                'md_comp':_pct(md_full,md_tot),'md_cc':int(md_tot)}
+                'md_comp':_pct(md_full,md_tot),'md_cc':int(md_tot),
+                'comp2':_pct(b_full,a_tot),'fp_comp2':_pct(bfp_full,fp_tot),'md_comp2':_pct(bmd_full,md_tot)}
     sizeset=[]
     for cat, c in sub.groupby('Cat'):
         subs=[]
@@ -1641,6 +1705,7 @@ summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
          'country_perf':country_perf,
          'markdown_kpi':markdown_kpi,
          'gp_kpi':gp_kpi,
+         'wh_kpi':wh_kpi,
          'ecom_kpi':ecom_kpi,
          'weekly':weekly,
          'stores':stores}
