@@ -626,6 +626,55 @@ for _loc,_sub in g.groupby('Location'): gp_kpi[_loc]=_gp_scope(_sub)
 for _cty,_sub in g.groupby('Country'): gp_kpi[_cty]=_gp_scope(_sub)
 gp_kpi['All Countries']=_gp_scope(g)
 
+# ---- Store area (sq ft) from the 'Productivity' tab + Productivity KPI ----
+# productivity = (period sales / days elapsed) * 365 / sq ft, converted AED->USD (always USD).
+# Physical stores only: ecom and any store without a sq-ft entry are excluded from both sides.
+def _load_sqft():
+    try:
+        sd = pd.read_excel(U+'FN_Color_Code_Master.xlsx', sheet_name='Productivity')
+        sd.columns=[str(c).strip() for c in sd.columns]
+        _lc = next((c for c in sd.columns if c.strip().lower() in ('location','store','store name')), sd.columns[0])
+        _ac = next((c for c in sd.columns if 'area' in str(c).lower() or 'sq' in str(c).lower()), None)
+        if _ac is None: return {}
+        out={}
+        for _n,_a in zip(sd[_lc], sd[_ac]):
+            if pd.notna(_n) and pd.notna(_a):
+                try: out[str(_n).strip()] = float(_a)
+                except Exception: pass
+        return out
+    except Exception as ex:
+        print('Productivity tab not read (productivity disabled):', ex); return {}
+STORE_SQFT=_load_sqft()
+print('Productivity sq-ft loaded: %d stores' % len(STORE_SQFT))
+_AEDUSD = 3.6725
+_PDAYS = {'yesterday':1, 'wtd':DAYS_ELAPSED, 'mtd':DAYS_IN_MONTH, 'ytd':DAYS_IN_YEAR}
+_PAMT  = {'yesterday':'YestAmt','wtd':'WTDamt','mtd':'MTDamt','ytd':'YTDamt'}
+_gstores = set(g['Location'].unique())
+_sqft = {L:a for L,a in STORE_SQFT.items() if L in _gstores}
+_unm  = [L for L in STORE_SQFT if L not in _gstores]
+if _unm: print('Productivity: %d sq-ft store(s) unmatched to sales (ignored): %s' % (len(_unm), _unm[:10]))
+_store_sales = {pp: g.groupby('Location')[c].sum().to_dict() for pp,c in _PAMT.items()}
+_store_cty   = g.groupby('Location')['Country'].first().to_dict()
+def _prod(sqft_sum, sales_sum, period):
+    d = _PDAYS[period]
+    if not (sqft_sum and sqft_sum>0 and d and d>0): return None
+    ann = (sales_sum / d) * 365.0
+    return int(round((ann / sqft_sum) / _AEDUSD))
+productivity_kpi = {}
+for L,a in _sqft.items():
+    productivity_kpi[L] = {pp:_prod(a,_store_sales[pp].get(L,0.0),pp) for pp in _PDAYS}
+_cty_sqft={}; _cty_sales={pp:{} for pp in _PDAYS}
+for L,a in _sqft.items():
+    c=_store_cty.get(L)
+    if c is None: continue
+    _cty_sqft[c]=_cty_sqft.get(c,0.0)+a
+    for pp in _PDAYS: _cty_sales[pp][c]=_cty_sales[pp].get(c,0.0)+_store_sales[pp].get(L,0.0)
+for c,a in _cty_sqft.items():
+    productivity_kpi[c] = {pp:_prod(a,_cty_sales[pp][c],pp) for pp in _PDAYS}
+_all_sqft=sum(_sqft.values())
+productivity_kpi['All Countries'] = {pp:_prod(_all_sqft, sum(_store_sales[pp].get(L,0.0) for L in _sqft), pp) for pp in _PDAYS}
+print('Productivity KPI: %d scopes (All-Countries YTD = $%s /sqft/yr)' % (len(productivity_kpi), productivity_kpi.get('All Countries',{}).get('ytd')))
+
 # ---- WH stock KPI: warehouse/DC qty for the current scope (current snapshot, not per-period) ----
 # Country / All Countries -> that country's (or all) merchandise WH qty.
 # Single store -> the store's country DC qty, restricted to the color codes the store holds.
@@ -1710,6 +1759,7 @@ summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
          'country_blobs':country_blobs,
          'country_perf':country_perf,
          'markdown_kpi':markdown_kpi,
+         'productivity_kpi':productivity_kpi,
          'gp_kpi':gp_kpi,
          'wh_kpi':wh_kpi,
          'ecom_kpi':ecom_kpi,
