@@ -1223,7 +1223,13 @@ except Exception as ex:
 # dropped by the Zap; if absent, the tiles simply show "accruing"/"—".
 ecom_kpi = {}
 try:
-    ECOM_FILE = _newest('FN_Ecom_Sales_*.xlsx')
+    # Find the newest ecom file with a LOCAL glob import — the module-level `_g`/`_newest`
+    # helper gets shadowed by a DataFrame earlier in this script, so we must not rely on it here.
+    import glob as _eglob
+    _ecands = sorted(_eglob.glob(U + 'FN_Ecom_Sales_*.xlsx'), key=os.path.getmtime)
+    if not _ecands:
+        raise FileNotFoundError('FN_Ecom_Sales_*.xlsx')
+    ECOM_FILE = _ecands[-1]
     print('Using ecom   :', os.path.basename(ECOM_FILE))
     # Title row + blank row precede the real header, so detect the header row ('Order No').
     _probe = pd.read_excel(ECOM_FILE, sheet_name=0, header=None, nrows=8)
