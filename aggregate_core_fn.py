@@ -562,7 +562,11 @@ g[['YestAmt','YestQty','MDamtYest','MDogvYest']] = g[['YestAmt','YestQty','MDamt
 # ---- markdown KPI: avg discount per store / country / All Countries, per period ----
 # discount% = 1 - (og-known net sales) / (qty * UAE og price), summed over the scope.
 def _md_ratio(amt_sum, ogv_sum):
-    return round2((1 - amt_sum/ogv_sum)*100) if (ogv_sum and ogv_sum>0) else None
+    # Self-contained rounding: this block runs before round2() is defined in this script.
+    if not (ogv_sum and ogv_sum > 0): return None
+    _v = (1 - amt_sum/ogv_sum) * 100
+    if _v != _v or _v in (float('inf'), float('-inf')): return None
+    return round(float(_v), 2)
 _MD_PER = [('yesterday','Yest'),('wtd','W'),('mtd','M'),('ytd','Y')]
 def _md_scope(sub):
     return {p: _md_ratio(sub['MDamt'+sfx].sum(), sub['MDogv'+sfx].sum()) for p,sfx in _MD_PER}
