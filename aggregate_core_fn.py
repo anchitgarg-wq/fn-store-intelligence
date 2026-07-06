@@ -495,8 +495,13 @@ for loc, r in _invp.iterrows():
     d['wtd']=_gp(r['cW'],r['sW']); d['mtd']=_gp(r['cM'],r['sM']); d['ytd']=_gp(r['cY'],r['sY'])
 print(f'GP% computed for {len(gp_store)} stores')
 
+# yesterday cost for category-level GP% (0 when the datewise file carries no cost column;
+# runs after gp_store above so it doesn't change that block's behaviour).
+if 'Cost Amt' not in yd.columns: yd['Cost Amt'] = 0
+yd['Cost Amt'] = pd.to_numeric(yd['Cost Amt'], errors='coerce').fillna(0)
 yd_key = yd.groupby(['Location','Key']).agg(YestAmt=('Net Sales Amt','sum'),
                                             YestQty=('Net Sales Qty','sum'),
+                                            YestCost=('Cost Amt','sum'),
                                             MDamtYest=('MDamtYest','sum'),
                                             MDogvYest=('MDogvYest','sum')).reset_index()
 
@@ -557,7 +562,7 @@ g = inv.groupby(['Country','Region','Location','Key']).agg(
 g['Group'] = [cat_for(k, fg) for k, fg in zip(g['Key'], g['Group'])]
 g['Dept']  = [sub_for(k, fd) for k, fd in zip(g['Key'], g['Dept'])]
 g = g.merge(yd_key, on=['Location','Key'], how='left')
-g[['YestAmt','YestQty','MDamtYest','MDogvYest']] = g[['YestAmt','YestQty','MDamtYest','MDogvYest']].fillna(0)
+g[['YestAmt','YestQty','YestCost','MDamtYest','MDogvYest']] = g[['YestAmt','YestQty','YestCost','MDamtYest','MDogvYest']].fillna(0)
 
 # ---- markdown KPI: avg discount per store / country / All Countries, per period ----
 # discount% = 1 - (og-known net sales) / (qty * UAE og price), summed over the scope.
@@ -574,6 +579,21 @@ markdown_kpi = {}
 for _loc,_sub in g.groupby('Location'): markdown_kpi[_loc]=_md_scope(_sub)
 for _cty,_sub in g.groupby('Country'): markdown_kpi[_cty]=_md_scope(_sub)
 markdown_kpi['All Countries']=_md_scope(g)
+
+# ---- GP% KPI: gross profit % per store / country / All Countries, per period (Total-row source) ----
+def _gp_ratio(cost_sum, sales_sum):
+    if not (sales_sum and sales_sum > 0 and cost_sum and cost_sum > 0): return None
+    _v = (1 - cost_sum/sales_sum) * 100
+    if _v != _v or _v in (float('inf'), float('-inf')): return None
+    return round(float(_v), 2)
+_GP_COLS = [('yesterday','YestCost','YestAmt'),('wtd','WTDcost','WTDamt'),
+            ('mtd','MTDcost','MTDamt'),('ytd','YTDcost','YTDamt')]
+def _gp_scope(sub):
+    return {p: _gp_ratio(sub[cc].sum(), sub[ac].sum()) for p,cc,ac in _GP_COLS}
+gp_kpi = {}
+for _loc,_sub in g.groupby('Location'): gp_kpi[_loc]=_gp_scope(_sub)
+for _cty,_sub in g.groupby('Country'): gp_kpi[_cty]=_gp_scope(_sub)
+gp_kpi['All Countries']=_gp_scope(g)
 
 # ---- per-period weeks-cover with cascade (selected period -> next -> next) ----
 # weekly rate from a period: (qty / days_elapsed_in_period) * 7
@@ -788,7 +808,13 @@ def cat_pivot(df):
             if not _hasmd: return None
             a=sub[ac].sum(); o=sub[oc].sum()
             return round2((1-a/o)*100) if (o and o>0) else None
+        def _gpp(cc,ac):
+            if cc not in sub.columns: return None
+            c=sub[cc].sum(); a=sub[ac].sum()
+            return round2((1-c/a)*100) if (a and a>0 and c and c>0) else None
         return {
+            'gp':{'yesterday':_gpp('YestCost','YestAmt'),'wtd':_gpp('WTDcost','WTDamt'),
+                  'mtd':_gpp('MTDcost','MTDamt'),'ytd':_gpp('YTDcost','YTDamt')},
             'md':{'yesterday':_mdp('MDamtYest','MDogvYest'),'wtd':_mdp('MDamtW','MDogvW'),
                   'mtd':_mdp('MDamtM','MDogvM'),'ytd':_mdp('MDamtY','MDogvY')},
             'rev':{'yesterday':round2(sub['YestAmt'].sum()),
@@ -1386,6 +1412,7 @@ for country, csub in g.groupby('Country'):
         MTDamt=('MTDamt','sum'),MTDqty=('MTDqty','sum'),MTDcost=('MTDcost','sum'),
         YTDamt=('YTDamt','sum'),YTDqty=('YTDqty','sum'),YTDcost=('YTDcost','sum'),
         InvQty=('InvQty','sum'),StockCost=('StockCost','sum'),Image=('Image','first'),
+        YestCost=('YestCost','sum'),
         MDamtYest=('MDamtYest','sum'),MDogvYest=('MDogvYest','sum'),
         MDamtW=('MDamtW','sum'),MDogvW=('MDogvW','sum'),
         MDamtM=('MDamtM','sum'),MDogvM=('MDogvM','sum'),
@@ -1427,6 +1454,7 @@ acg = g.groupby('Key').agg(
     MTDamt=('MTDamt','sum'),MTDqty=('MTDqty','sum'),MTDcost=('MTDcost','sum'),
     YTDamt=('YTDamt','sum'),YTDqty=('YTDqty','sum'),YTDcost=('YTDcost','sum'),
     InvQty=('InvQty','sum'),StockCost=('StockCost','sum'),Image=('Image','first'),
+    YestCost=('YestCost','sum'),
     MDamtYest=('MDamtYest','sum'),MDogvYest=('MDogvYest','sum'),
     MDamtW=('MDamtW','sum'),MDogvW=('MDogvW','sum'),
     MDamtM=('MDamtM','sum'),MDogvM=('MDogvM','sum'),
@@ -1612,6 +1640,7 @@ summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
          'country_blobs':country_blobs,
          'country_perf':country_perf,
          'markdown_kpi':markdown_kpi,
+         'gp_kpi':gp_kpi,
          'ecom_kpi':ecom_kpi,
          'weekly':weekly,
          'stores':stores}
