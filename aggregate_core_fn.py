@@ -920,6 +920,11 @@ def _core_size(s):
         n = int(m.group(1))
         if n in _CORE_SET: return n
     return None
+# Size-set completeness is an apparel concept (the 8-16 size run). Restrict it to the women's
+# apparel categories that use that run; non-apparel (bags, jewellery, girls-wear, belts,
+# hangers/packaging, and other runs) is excluded from BOTH size-set logics and the total.
+APPAREL_CATS = {'DRESSES','TOPS','OUTERWEAR','SKIRTS','PANTS','PETITE'}
+def _is_apparel(cat): return str(cat).strip().upper() in APPAREL_CATS
 SIZESET_FULL_MIN = 4
 def inventory_snapshot(df, country=None):
     """Build the 4-part inventory snapshot for an inventory sub-frame (a store or a
@@ -1028,6 +1033,7 @@ def inventory_snapshot(df, country=None):
                 'comp2':_pct(b_full,a_tot),'fp_comp2':_pct(bfp_full,fp_tot),'md_comp2':_pct(bmd_full,md_tot)}
     sizeset=[]
     for cat, c in sub.groupby('Cat'):
+        if not _is_apparel(cat): continue   # size-set completeness = apparel categories only
         subs=[]
         for sname, cc in c.groupby('Sub'):
             row=_setcomp(cc)
@@ -1046,7 +1052,7 @@ def inventory_snapshot(df, country=None):
     tot_season={'q':round2(sub['_q'].sum()),'v':round2(sub['_v'].sum())}
     tot_style=int(sub['Key'].nunique())
     tot_size=_avail(sub)   # overall equal-weighted size availability across every stocked style
-    tot_sizeset=_setcomp(sub)  # overall size-set completeness (FP/MD split) across all stocked color codes
+    tot_sizeset=_setcomp(sub[sub['Cat'].map(_is_apparel)])  # overall size-set completeness — apparel categories only
 
     return {'fpmd':fpmd,'season':season,'style':style,'size':size,'sizeset':sizeset,
             'totals':{'fpmd':tot_fpmd,'season':tot_season,'style':tot_style,'size':tot_size,'sizeset':tot_sizeset},
