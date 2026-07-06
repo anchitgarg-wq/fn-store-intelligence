@@ -68,6 +68,16 @@ key = pd.read_excel(U+'FN_Color_Code_Master.xlsx', dtype=str, header=1); key.col
 key['Item Barcode']=key['Item Barcode'].str.strip()
 b2k = key.dropna(subset=['Color Code']).drop_duplicates('Item Barcode').set_index('Item Barcode')['Color Code'].to_dict()
 
+# UAE OG price (AED) per barcode, for markdown/discount tracking. With header=1 the duplicate
+# country columns land as OG PRICE (base name e.g. 'UAE'), CP ('UAE.1'), TAG ('UAE.2'); the
+# base 'UAE' column is the OG PRICE. Both this and the sales feed are in AED, so they compare
+# directly. UAE price is used as the single reference for all countries (per stakeholder).
+og_uae = {}
+if 'UAE' in key.columns:
+    _oguae = pd.to_numeric(key['UAE'], errors='coerce')
+    og_uae = {bc: v for bc, v in zip(key['Item Barcode'], _oguae) if pd.notna(v)}
+print('UAE OG price loaded for %d barcodes' % len(og_uae))
+
 # Color Code -> clean display name. FN master has Item Description + Item Color; build
 # "Description · Colour" (size-free), falling back to inventory Item Description downstream.
 def clean_name(sn, col):
@@ -406,6 +416,9 @@ yd['Location']=yd['Location'].map(norm_store)
 yd = yd[yd['Location'].map(is_physical)].copy()
 yd['Key']=yd['Item Barcode'].map(b2k).fillna('BC-'+yd['Item Barcode'])
 yd = num(yd, ['Net Sales Amt','Net Sales Qty'])
+yd['_og'] = pd.to_numeric(yd['Item Barcode'].map(og_uae), errors='coerce')
+yd['MDogvYest'] = pd.to_numeric(yd['Net Sales Qty'],errors='coerce') * yd['_og']
+yd['MDamtYest'] = pd.to_numeric(yd['Net Sales Amt'],errors='coerce').where(yd['_og'].notna(), 0.0)
 
 # ---- Tag-based yesterday FP metrics, per store (from master FP/MD tag) ----
 # Authoritative FP/MD comes from the master. For each store's yesterday sales:
@@ -483,7 +496,9 @@ for loc, r in _invp.iterrows():
 print(f'GP% computed for {len(gp_store)} stores')
 
 yd_key = yd.groupby(['Location','Key']).agg(YestAmt=('Net Sales Amt','sum'),
-                                            YestQty=('Net Sales Qty','sum')).reset_index()
+                                            YestQty=('Net Sales Qty','sum'),
+                                            MDamtYest=('MDamtYest','sum'),
+                                            MDogvYest=('MDogvYest','sum')).reset_index()
 
 # ---------------- excluded-category yesterday sellers (Top-list fallback) ----------------
 # The dashboard scopes merchandise to core categories (footwear/handbags/accessories/bags),
@@ -512,6 +527,16 @@ if _GRP_COL and _DEP_COL:
         if 'Desc' not in xcat_rows.columns: xcat_rows['Desc']=xcat_rows['Key']
         print(f"Excluded-category yesterday sellers captured (Top-list fallback): {len(xcat_rows)} rows")
 
+# ---- markdown inputs: UAE OG price (AED) vs AED net sales -> discount% = 1 - sales/(qty*og)
+# Per barcode, per period, emit paired sums: MDamt<P> (og-known net sales) and MDogv<P>
+# (qty * og). og-unknown barcodes contribute to neither, keeping the ratio consistent.
+inv['_og'] = pd.to_numeric(inv['Item Barcode'].map(og_uae), errors='coerce')
+for _sfx,_qc,_ac in [('W','Net Sales Qty (WTD)','Net Sales Amt (WTD)'),
+                     ('M','Net Sales Qty (MTD)','Net Sales Amt (MTD)'),
+                     ('Y','Net Sales Qty (YTD)','Net Sales Amt (YTD)')]:
+    inv['MDogv'+_sfx] = pd.to_numeric(inv[_qc],errors='coerce') * inv['_og']
+    inv['MDamt'+_sfx] = pd.to_numeric(inv[_ac],errors='coerce').where(inv['_og'].notna(), 0.0)
+
 # ---------------- store x Key aggregation ----------------
 g = inv.groupby(['Country','Region','Location','Key']).agg(
         Desc=('Item Description','first'),
@@ -522,6 +547,9 @@ g = inv.groupby(['Country','Region','Location','Key']).agg(
         YTDamt=('Net Sales Amt (YTD)','sum'), YTDqty=('Net Sales Qty (YTD)','sum'), YTDcost=('Cost Amt (YTD)','sum'),
         InvQty=('Inventory Qty','sum'), InvValue=('Inventory Value','sum'),
         StockCost=('StockCost','sum'), UnitCost=('Unit Cost','mean'),
+        MDamtW=('MDamtW','sum'), MDogvW=('MDogvW','sum'),
+        MDamtM=('MDamtM','sum'), MDogvM=('MDogvM','sum'),
+        MDamtY=('MDamtY','sum'), MDogvY=('MDogvY','sum'),
     ).reset_index()
 # Relabel group (Category) and dept (Sub category) from the FN_Color_Code_Master, keyed by
 # Color Code (== Key). Inventory's Item Group/Department remain only as a fallback when a
@@ -529,7 +557,19 @@ g = inv.groupby(['Country','Region','Location','Key']).agg(
 g['Group'] = [cat_for(k, fg) for k, fg in zip(g['Key'], g['Group'])]
 g['Dept']  = [sub_for(k, fd) for k, fd in zip(g['Key'], g['Dept'])]
 g = g.merge(yd_key, on=['Location','Key'], how='left')
-g[['YestAmt','YestQty']] = g[['YestAmt','YestQty']].fillna(0)
+g[['YestAmt','YestQty','MDamtYest','MDogvYest']] = g[['YestAmt','YestQty','MDamtYest','MDogvYest']].fillna(0)
+
+# ---- markdown KPI: avg discount per store / country / All Countries, per period ----
+# discount% = 1 - (og-known net sales) / (qty * UAE og price), summed over the scope.
+def _md_ratio(amt_sum, ogv_sum):
+    return round2((1 - amt_sum/ogv_sum)*100) if (ogv_sum and ogv_sum>0) else None
+_MD_PER = [('yesterday','Yest'),('wtd','W'),('mtd','M'),('ytd','Y')]
+def _md_scope(sub):
+    return {p: _md_ratio(sub['MDamt'+sfx].sum(), sub['MDogv'+sfx].sum()) for p,sfx in _MD_PER}
+markdown_kpi = {}
+for _loc,_sub in g.groupby('Location'): markdown_kpi[_loc]=_md_scope(_sub)
+for _cty,_sub in g.groupby('Country'): markdown_kpi[_cty]=_md_scope(_sub)
+markdown_kpi['All Countries']=_md_scope(g)
 
 # ---- per-period weeks-cover with cascade (selected period -> next -> next) ----
 # weekly rate from a period: (qty / days_elapsed_in_period) * 7
@@ -739,7 +779,14 @@ def cat_pivot(df):
     recomputes mix % within the selected period's grand total. Node ordering uses YTD revenue
     (populated for every node) so the tree's sort is stable across period switches."""
     def node_vals(sub):
+        _hasmd = 'MDogvYest' in sub.columns
+        def _mdp(ac,oc):
+            if not _hasmd: return None
+            a=sub[ac].sum(); o=sub[oc].sum()
+            return round2((1-a/o)*100) if (o and o>0) else None
         return {
+            'md':{'yesterday':_mdp('MDamtYest','MDogvYest'),'wtd':_mdp('MDamtW','MDogvW'),
+                  'mtd':_mdp('MDamtM','MDogvM'),'ytd':_mdp('MDamtY','MDogvY')},
             'rev':{'yesterday':round2(sub['YestAmt'].sum()),
                    'wtd':round2(sub['WTDamt'].sum()),
                    'mtd':round2(sub['MTDamt'].sum()),
@@ -1335,6 +1382,10 @@ for country, csub in g.groupby('Country'):
         MTDamt=('MTDamt','sum'),MTDqty=('MTDqty','sum'),MTDcost=('MTDcost','sum'),
         YTDamt=('YTDamt','sum'),YTDqty=('YTDqty','sum'),YTDcost=('YTDcost','sum'),
         InvQty=('InvQty','sum'),StockCost=('StockCost','sum'),Image=('Image','first'),
+        MDamtYest=('MDamtYest','sum'),MDogvYest=('MDogvYest','sum'),
+        MDamtW=('MDamtW','sum'),MDogvW=('MDogvW','sum'),
+        MDamtM=('MDamtM','sum'),MDogvM=('MDogvM','sum'),
+        MDamtY=('MDamtY','sum'),MDogvY=('MDogvY','sum'),
     ).reset_index()
     rwk=np.where(cg['WTDqty']>0,(cg['WTDqty']/DAYS_ELAPSED)*7,np.nan)
     rmo=np.where(cg['MTDqty']>0,(cg['MTDqty']/DAYS_IN_MONTH)*7,np.nan)
@@ -1372,6 +1423,10 @@ acg = g.groupby('Key').agg(
     MTDamt=('MTDamt','sum'),MTDqty=('MTDqty','sum'),MTDcost=('MTDcost','sum'),
     YTDamt=('YTDamt','sum'),YTDqty=('YTDqty','sum'),YTDcost=('YTDcost','sum'),
     InvQty=('InvQty','sum'),StockCost=('StockCost','sum'),Image=('Image','first'),
+    MDamtYest=('MDamtYest','sum'),MDogvYest=('MDogvYest','sum'),
+    MDamtW=('MDamtW','sum'),MDogvW=('MDogvW','sum'),
+    MDamtM=('MDamtM','sum'),MDogvM=('MDogvM','sum'),
+    MDamtY=('MDamtY','sum'),MDogvY=('MDogvY','sum'),
 ).reset_index()
 rwk=np.where(acg['WTDqty']>0,(acg['WTDqty']/DAYS_ELAPSED)*7,np.nan)
 rmo=np.where(acg['MTDqty']>0,(acg['MTDqty']/DAYS_IN_MONTH)*7,np.nan)
@@ -1552,6 +1607,7 @@ summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
          'store_country':store_country,
          'country_blobs':country_blobs,
          'country_perf':country_perf,
+         'markdown_kpi':markdown_kpi,
          'ecom_kpi':ecom_kpi,
          'weekly':weekly,
          'stores':stores}
