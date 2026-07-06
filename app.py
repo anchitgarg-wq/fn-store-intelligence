@@ -5,6 +5,7 @@ Flow:
   Zapier (gate passed) --POST /refresh--> this service
      body JSON: { "inventory_url": ..., "sales_url": ..., "kpi_url": ...,
                   "key_master_url": ..., "image_master_url": ...,
+                  "ecom_url"/"fn_ecom_url": ... (optional),
                   "as_of": "YYYY-MM-DD" (optional), "token": "<shared secret>" }
   -> download the 5 files into a temp folder under the EXACT names aggregate_core.py expects
   -> run aggregate_core.py (unchanged business logic) to produce summary.json
@@ -42,6 +43,14 @@ TARGET_NAMES = {
     "key_master_url":  "FN_Color_Code_Master.xlsx",
     # image master handled specially (see save_image_master)
 }
+
+# Optional feeds: downloaded only if a URL is supplied; a missing optional file is NOT an
+# error (aggregate_core.py degrades gracefully when it's absent). Each entry lists the
+# payload keys to try (in order) so the ecom file works whether the Zap sends 'fn_ecom_url'
+# or a plain 'ecom_url'.
+OPTIONAL_FEEDS = [
+    (("fn_ecom_url", "ecom_url"), "FN_Ecom_Sales_current.xlsx"),  # matches FN_Ecom_Sales_*.xlsx glob
+]
 
 
 def _extract_drive_id(url):
@@ -151,6 +160,11 @@ def run_refresh(payload):
             if not url:
                 raise ValueError(f"missing required url: {key}")
             _download(url, os.path.join(folder, fname))
+        # 1b) optional feeds (e.g. ecom sales) — fetch only when a URL is supplied
+        for keys, fname in OPTIONAL_FEEDS:
+            url = next((payload.get(k) for k in keys if payload.get(k)), None)
+            if url:
+                _download(url, os.path.join(folder, fname))
         # 2) image master (normalised)
         if not payload.get("image_master_url"):
             raise ValueError("missing required url: image_master_url")
