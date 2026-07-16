@@ -307,6 +307,110 @@ try:
 except Exception as ex:
     print('LFL Dates tab not loaded:', ex)
 
+# ---------------- Shipment tracker ('Shipment Tracker' tab in FN_Color_Code_Master) -------------
+# Inbound shipments with an ETA at Jebel Ali, bucketed into forward ISO weeks (Monday start,
+# matching the weekly-trend panel) for the next SHIP_HORIZON weeks.
+#
+# DESIGN NOTES:
+#  * HEADER ROW IS DETECTED, NOT ASSUMED. FN's tab puts the header on row 1; SM's has a title
+#    row above it. The header is found by scanning for the row containing 'ETA', so the same
+#    code reads both without a per-brand fork.
+#  * COLUMNS ARE MATCHED BY NAME, NOT POSITION. FN's order is SHIP NO / CRTNS / QTY / ETA;
+#    SM's is Remarks / SHIP NO / ETA / CRTNS / QTY. Name-matching absorbs the difference, and
+#    tolerates the stray punctuation in the real headers ('SHIP NO:', 'ETA @ JABAL Ali').
+#  * A SHIPMENT IS A DISTINCT 'SHIP NO:', not a row -- counting rows would overstate the number
+#    of shipments if a ship number ever spans multiple lines.
+#  * NO LOCATION KEY. The tracker cannot be attributed to a store or country, so it is a GLOBAL
+#    figure and the dashboard renders it only on the All-Countries / All-Stores view.
+#  * DIFFERENT SUPPLY-CHAIN STAGE FROM THE ERP's 'In Transit Qty'. This is vessels inbound to
+#    PORT (not landed, not in the WH, not allocated). In Transit Qty is stock already moving
+#    between locations. They must never be presented as the same measure or compared.
+#  * OVERDUE AND NO-ETA GET THEIR OWN ROWS -- never silently dropped; they are the ones that matter.
+SHIP_HORIZON = 10   # forward weeks shown
+shipments = None
+try:
+    _sh = None
+    for _sn2 in ('Shipment Tracker', 'shipment_tracker', 'Shipment_Tracker', 'shipment tracker'):
+        try:
+            _sh = pd.read_excel(U+'FN_Color_Code_Master.xlsx', sheet_name=_sn2, header=None); break
+        except Exception:
+            _sh = None
+    if _sh is None or _sh.empty:
+        print('Shipment tracker: tab not found (card will hide).')
+    else:
+        _hr = None
+        for _i in range(min(10, len(_sh))):
+            _vals = [str(v).strip().upper() for v in _sh.iloc[_i].tolist()]
+            if any('ETA' in v for v in _vals):
+                _hr = _i; break
+        if _hr is None:
+            raise ValueError("no header row containing 'ETA' found in Shipment Tracker")
+        _sh.columns = [str(c).strip() for c in _sh.iloc[_hr]]
+        _sh = _sh.iloc[_hr + 1:].reset_index(drop=True)
+        def _shcol(*tokens):
+            for c in _sh.columns:
+                cl = str(c).strip().lower()
+                if all(t in cl for t in tokens):
+                    return c
+            return None
+        _c_ship = _shcol('ship')
+        _c_eta  = _shcol('eta')
+        _c_qty  = _shcol('qty')
+        _c_crt  = _shcol('crtn') or _shcol('carton')
+        _c_sta  = _shcol('status')
+        if not (_c_ship and _c_eta and _c_qty):
+            raise ValueError('Shipment Tracker missing Ship No / ETA / QTY columns; found: %s' % list(_sh.columns))
+        _sh = _sh.rename(columns={_c_ship: 'ship', _c_eta: 'eta', _c_qty: 'qty'})
+        _sh['crtns']  = pd.to_numeric(_sh[_c_crt], errors='coerce') if _c_crt else 0
+        _sh['status'] = _sh[_c_sta].astype(str).str.strip() if _c_sta else ''
+        _sh['ship']   = _sh['ship'].astype(str).str.strip()
+        _sh = _sh[(_sh['ship'] != '') & (_sh['ship'].str.lower() != 'nan')]
+        _sh['qty']   = pd.to_numeric(_sh['qty'], errors='coerce').fillna(0)
+        _sh['crtns'] = pd.to_numeric(_sh['crtns'], errors='coerce').fillna(0)
+        # ETA is written DD/MM/YYYY. Excel may hand it over as a real datetime or as text;
+        # handle both, and parse text dayfirst.
+        _eta_num = pd.to_numeric(_sh['eta'], errors='coerce')
+        _eta_serial = pd.to_datetime(_eta_num.where((_eta_num >= 1) & (_eta_num <= 60000)),
+                                     unit='D', origin='1899-12-30', errors='coerce')
+        _eta_real = pd.to_datetime(_sh['eta'], errors='coerce', dayfirst=True)
+        _sh['_eta'] = _eta_serial.fillna(_eta_real)
+
+        def _shagg(sub):
+            return {'n': int(sub['ship'].nunique()),
+                    'qty': int(round(float(sub['qty'].sum()))),
+                    'crtns': int(round(float(sub['crtns'].sum())))}
+
+        _mon = AS_OF - dt.timedelta(days=AS_OF.weekday())   # Monday of the current week
+        _swk = []
+        for _i in range(SHIP_HORIZON):
+            _ws = _mon + dt.timedelta(weeks=_i)
+            _we = _ws + dt.timedelta(days=6)
+            _m = _sh['_eta'].notna() & (_sh['_eta'].dt.date >= _ws) & (_sh['_eta'].dt.date <= _we)
+            _iso = _ws.isocalendar()
+            _swk.append({'iso': '%d-W%02d' % (_iso[0], _iso[1]), 'label': 'Wk %d' % _iso[1],
+                         'start': _ws.isoformat(), 'end': _we.isoformat(),
+                         'range': '%s \u2013 %s' % (_ws.strftime('%d %b'), _we.strftime('%d %b')),
+                         'current': bool(_i == 0), **_shagg(_sh[_m])})
+        _hz_end = _mon + dt.timedelta(weeks=SHIP_HORIZON) - dt.timedelta(days=1)
+        shipments = {
+            'weeks':   _swk,
+            'overdue': _shagg(_sh[_sh['_eta'].notna() & (_sh['_eta'].dt.date < _mon)]),
+            'noeta':   _shagg(_sh[_sh['_eta'].isna()]),
+            'beyond':  _shagg(_sh[_sh['_eta'].notna() & (_sh['_eta'].dt.date > _hz_end)]),
+            'total':   _shagg(_sh),
+            'horizon': SHIP_HORIZON,
+            'week_start': _mon.isoformat(),
+            'scope': 'global',
+        }
+        print('Shipments: %d ship nos | %s units | horizon %dw from %s | overdue=%d no-ETA=%d beyond=%d'
+              % (shipments['total']['n'], f"{shipments['total']['qty']:,}", SHIP_HORIZON, _mon,
+                 shipments['overdue']['n'], shipments['noeta']['n'], shipments['beyond']['n']))
+except Exception as _shex:
+    import traceback as _shtb
+    print('Shipment tracker SKIPPED (payload still ships):', _shex)
+    print(_shtb.format_exc())
+    shipments = None
+
 # ---------------- image lookup (FN: color code -> Image Link) ----------------
 key2img = {}
 try:
@@ -1610,8 +1714,36 @@ store_rev = inv.groupby(['Country','Location']).agg(
 
 # yesterday revenue per store (from datewise file)
 yd_store = yd.groupby('Location')['Net Sales Amt'].sum()
-# wtd: qty only
-wtd_store = inv.groupby('Location')['Net Sales Qty (WTD)'].sum()
+# WTD per store — sourced from the KPI FILE so the store ranking matches the KPI TILES exactly.
+# Previously WTD ranked by the inventory feed's WTD QTY, which disagreed with the tiles (they read
+# WTD sales from agg_window over the KPI file, a different as-of). We now rank by KPI-file WTD
+# SALES over the tiles' own window (win('wtd')). Any store present in inventory but missing from
+# the KPI file falls back to its inventory WTD qty so it never silently drops from the ranking.
+def _kpi_wtd_by_store():
+    out = {}
+    try:
+        _s, _e = win('wtd')
+        _w = kdf[(kdf['Date'].dt.date >= _s) & (kdf['Date'].dt.date <= _e)]
+        if not _w.empty and 'Net Sales Amt' in _w.columns:
+            out = _w.groupby('Location')['Net Sales Amt'].sum().to_dict()
+    except Exception as _kex:
+        print('WTD-by-store from KPI file unavailable, using inventory WTD:', _kex)
+    return out
+_kpi_wtd = _kpi_wtd_by_store()
+_inv_wtd_qty = inv.groupby('Location')['Net Sales Qty (WTD)'].sum()
+if _kpi_wtd:
+    _missing = sorted(set(_inv_wtd_qty.index) - set(_kpi_wtd.keys()))
+    if _missing:
+        print('WTD ranking: %d store(s) not in KPI file -> inventory-WTD fallback: %s'
+              % (len(_missing), _missing[:10]))
+    wtd_store = pd.Series({L: _kpi_wtd.get(L, float(_inv_wtd_qty.get(L, 0.0))) for L in _inv_wtd_qty.index})
+    _WTD_IS_QTY = False   # now KPI sales amount
+    print('WTD ranking source: KPI file (%d stores) + inventory fallback (%d)'
+          % (len(_kpi_wtd), len(_missing)))
+else:
+    wtd_store = _inv_wtd_qty
+    _WTD_IS_QTY = True    # fell back to inventory qty
+    print('WTD ranking source: inventory feed qty (KPI file unavailable)')
 mtd_store = inv.groupby('Location')['Net Sales Amt (MTD)'].sum()
 ytd_store = inv.groupby('Location')['Net Sales Amt (YTD)'].sum()
 loc_country = inv.groupby('Location')['Country'].first()
@@ -1644,7 +1776,7 @@ def build_store_rank(series, is_qty=False):
 
 store_rank={
     'yesterday':build_store_rank(yd_store),
-    'wtd':build_store_rank(wtd_store, is_qty=True),
+    'wtd':build_store_rank(wtd_store, is_qty=_WTD_IS_QTY),
     'mtd':build_store_rank(mtd_store),
     'ytd':build_store_rank(ytd_store),
 }
@@ -1764,6 +1896,7 @@ summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
          'wh_kpi':wh_kpi,
          'ecom_kpi':ecom_kpi,
          'weekly':weekly,
+         'shipments':shipments,
          'stores':stores}
 
 json.dump(summary, open(OUT,'w'), separators=(',',':'))
