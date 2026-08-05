@@ -179,13 +179,33 @@ for _cty in TAG_COUNTRIES:
 if len(_tag_col_map) == len(TAG_COUNTRIES):
     # Defensive check: confirm each detected TAG column actually holds FP/MD/#N/A values
     # (not prices) before trusting it — catches a master whose column layout shifted.
+    # Values that are not a tag but are not evidence of a layout shift either: a blank-ish
+    # placeholder typed into an otherwise valid tag cell. These are treated as "no tag" for
+    # that barcode, exactly like '#N/A'.
+    _NON_TAG = {'#N/A', '-', '--', 'N/A', 'NA', 'NIL', 'NONE', ''}
+    # A column is only rejected when the junk is WIDESPREAD. A handful of stray cells in a
+    # column that is otherwise 99%% FP/MD is bad data, not a shifted layout - and zeroing
+    # every barcode because of 16 cells (which is what happened on 2026-08-04, taking FP
+    # Sales to 0%% while GP and markdown stayed healthy) is far worse than skipping them.
+    _JUNK_TOLERANCE = 0.05      # reject the column only if >5% of its values are unrecognised
     _tagcols_ok = True
     for _cty, _col in _tag_col_map.items():
-        _seen = set(_valid_fp[_col].dropna().astype(str).str.strip().str.upper().unique())
-        _bad = _seen - {'FP','MD','#N/A'}
-        if _bad:
-            print(f'FP/MD tag column for {_cty} ({_col}) has unexpected values {sorted(_bad)[:5]} '
+        _vals = _valid_fp[_col].dropna().astype(str).str.strip().str.upper()
+        _unknown = _vals[~_vals.isin({'FP','MD'} | _NON_TAG)]
+        _tagged = _vals[_vals.isin({'FP','MD'})]
+        _share = (len(_unknown) / len(_vals)) if len(_vals) else 0.0
+        if len(_unknown) and _share <= _JUNK_TOLERANCE:
+            print(f'FP/MD tag column for {_cty} ({_col}): {len(_unknown)} unrecognised value(s) '
+                  f'{sorted(set(_unknown))[:5]} ({_share:.2%} of the column) treated as untagged; '
+                  f'{len(_tagged)} valid FP/MD tags kept')
+        elif len(_unknown):
+            print(f'FP/MD tag column for {_cty} ({_col}) has unexpected values '
+                  f'{sorted(set(_unknown))[:5]} in {_share:.1%} of rows '
                   f'- master column layout may have shifted; FP/MD will be empty')
+            _tagcols_ok = False
+        elif not len(_tagged):
+            print(f'FP/MD tag column for {_cty} ({_col}) holds no FP/MD values at all '
+                  f'- FP/MD will be empty')
             _tagcols_ok = False
     if _tagcols_ok:
         for _cty, _col in _tag_col_map.items():
