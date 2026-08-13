@@ -1913,6 +1913,147 @@ for _p in ['yesterday','wtd','mtd','ytd']:
         })
     rows.sort(key=lambda r:-(r['sales_ty'] or 0))
     country_perf[_p]=rows
+REVIEWS_NAME_MAP = {
+    'Forever New 360 Mall': 'FN 360 MALL',
+    'Forever New Al Kout Mall': 'FN ALKOUT MALL',
+    'Forever New Avenues Bahrain': 'FN AVENUES MALL-BAHRAIN',
+    'Forever New Bahrain City Center': 'FN CITY CENTRE BAHRAIN',
+    'Forever New Doha Festival City': 'FN Doha Festival City',
+    'Forever New Dubai Hills': 'FN DUBAI HILLS',
+    'Forever New Galleria Mall - Abu Dhabi': 'FN THE GALLERIA-ABU DHABI',
+    'Forever New Marassi Galleria': 'FN MARASSI GALLERIA MALL-BAHRAIN',
+    'Forever New Reem Mall': 'FN REEM MALL-ABU DHABI',
+    'Forever New Riyadh Park': 'FN RIYADH PARK MALL',
+}
+REVIEWS_BRAND_PREFIX = 'Forever New'
+# Read the DEDUPED tab. Zapier occasionally double-writes to Raw_Reviews (~1,015 dupes seen);
+# Raw_Reviews_Unique is keyed unique on review_id. Pin by name, but fall back to whichever
+# sheet actually carries the review columns so a tab rename can't silently zero the tile.
+REVIEWS_SHEET = 'Raw_Reviews_Unique'
+REVIEWS_SHEET_FALLBACKS = ('Raw_Reviews_Unique', 'Raw_Reviews')
+REVIEWS_REQUIRED_COLS = ('review_id', 'store_name', 'rating')
+
+def _reviews_pick_sheet(path):
+    import pandas as _pd  # local alias
+    try:
+        xl = _pd.ExcelFile(path)
+    except Exception as e:
+        print('Reviews: cannot open workbook (%s)' % e); return None
+    order = [s for s in REVIEWS_SHEET_FALLBACKS if s in xl.sheet_names] + \
+            [s for s in xl.sheet_names if s not in REVIEWS_SHEET_FALLBACKS]
+    for s in order:
+        try:
+            head = pd.read_excel(path, sheet_name=s, nrows=0)
+            cols = [str(c).strip() for c in head.columns]
+            if all(c in cols for c in REVIEWS_REQUIRED_COLS):
+                if s != REVIEWS_SHEET:
+                    print('Reviews: sheet %r not found, using %r by column match' % (REVIEWS_SHEET, s))
+                return s
+        except Exception:
+            continue
+    print('Reviews: no sheet with columns %s' % (REVIEWS_REQUIRED_COLS,))
+    return None
+
+def _reviews_build():
+    import datetime as _rdt
+    try:
+        RFILE = _newest('Reviews_FN.xlsx', 'Reviews_FN.csv')
+    except FileNotFoundError:
+        print('Reviews report not present (Reviews_FN.xlsx) - reviews tile will be absent.')
+        return None
+    print('Using reviews:', os.path.basename(RFILE))
+    sheet = _reviews_pick_sheet(RFILE)
+    if sheet is None:
+        return None
+    rdf = pd.read_excel(RFILE, sheet_name=sheet, header=0)
+    rdf.columns = [str(c).strip() for c in rdf.columns]
+    def _col(cands, pos):
+        for c in cands:
+            if c in rdf.columns: return c
+        return rdf.columns[pos] if pos < len(rdf.columns) else None
+    c_id   = _col(['review_id'], 0)
+    c_name = _col(['store_name'], 1)
+    c_rate = _col(['rating'], 4)
+    c_date = _col(['review_date'], 7)
+
+    _canon_map = { _canon(k): v for k, v in REVIEWS_NAME_MAP.items() }
+    today = _rdt.date.today()
+    def _cut(days): return today - _rdt.timedelta(days=days)
+    WIN = {'wtd': _cut(7), 'mtd': _cut(30), 'ytd': _cut(365)}
+
+    from collections import defaultdict as _dd
+    store_acc = _dd(lambda: {p: [0, 0.0] for p in ('yesterday','wtd','mtd','ytd','all')})
+    seen_ids = set()
+    kept = dropped = undated = dup = 0
+    unmapped = _dd(int)
+
+    for _, row in rdf.iterrows():
+        rid = str(row.get(c_id, '')).strip()
+        sn = str(row.get(c_name, '')).strip()
+        if not rid or rid.lower() == 'nan' or not sn.startswith(REVIEWS_BRAND_PREFIX):
+            dropped += 1; continue
+        if rid in seen_ids:                     # belt-and-braces even on the unique tab
+            dup += 1; continue
+        seen_ids.add(rid)
+        try:
+            rating = float(row.get(c_rate))
+        except (TypeError, ValueError):
+            dropped += 1; continue
+        if not (1 <= rating <= 5):
+            dropped += 1; continue
+        erp = _canon_map.get(_canon(sn))
+        if not erp:
+            unmapped[sn] += 1; dropped += 1; continue
+        d = None
+        dv = row.get(c_date)
+        if dv is not None and str(dv).strip() and str(dv).strip().lower() != 'nan':
+            s = str(dv).strip().split()[0]
+            for fmt in ('%m/%d/%Y', '%Y-%m-%d', '%d/%m/%Y'):
+                try: d = _rdt.datetime.strptime(s, fmt).date(); break
+                except ValueError: pass
+        acc = store_acc[erp]
+        acc['all'][0] += 1; acc['all'][1] += rating
+        if d is None:
+            undated += 1
+        else:
+            if d == _cut(1):
+                acc['yesterday'][0] += 1; acc['yesterday'][1] += rating
+            for p in ('wtd','mtd','ytd'):
+                if d > WIN[p]:
+                    acc[p][0] += 1; acc[p][1] += rating
+        kept += 1
+
+    def _mk(pair):
+        n, s = pair
+        return {'count': n, 'avg': round(s / n, 2) if n else None}
+
+    stores_out = {erp: {p: _mk(per[p]) for p in per} for erp, per in store_acc.items()}
+
+    country_acc = _dd(lambda: {p: [0, 0.0] for p in ('yesterday','wtd','mtd','ytd','all')})
+    allc = {p: [0, 0.0] for p in ('yesterday','wtd','mtd','ytd','all')}
+    for erp, per in store_acc.items():
+        cy = store_country.get(erp) or store_country.get(_canon(erp))
+        for p in per:
+            n, s = per[p]
+            allc[p][0] += n; allc[p][1] += s
+            if cy:
+                country_acc[cy][p][0] += n; country_acc[cy][p][1] += s
+    countries_out = {c: {p: _mk(v[p]) for p in v} for c, v in country_acc.items()}
+    all_out = {p: _mk(allc[p]) for p in allc}
+
+    if unmapped:
+        print('Reviews: %d unmapped store name(s) (shown as 0) -> %s'
+              % (len(unmapped), dict(list(unmapped.items())[:8])))
+    print('Reviews: sheet %r, kept %d, dropped %d, dup-skipped %d, undated %d, anchor %s'
+          % (sheet, kept, dropped, dup, undated, today.isoformat()))
+
+    return {'stores': stores_out, 'countries': countries_out, 'all': all_out,
+            'anchor': today.isoformat(),
+            'audit': {'kept': kept, 'dropped': dropped, 'dup': dup, 'undated': undated,
+                      'unmapped': dict(unmapped)}}
+
+reviews = _reviews_build()
+
 summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
                  'days_elapsed_month':DAYS_IN_MONTH,'days_elapsed_year':DAYS_IN_YEAR,
                  'generated':dt.datetime.now().isoformat(timespec='seconds'),
@@ -1929,7 +2070,8 @@ summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
          'ecom_kpi':ecom_kpi,
          'weekly':weekly,
          'shipments':shipments,
-         'stores':stores}
+         'stores':stores,
+         'reviews':reviews}
 
 json.dump(summary, open(OUT,'w'), separators=(',',':'))
 sz=os.path.getsize(OUT)/1024

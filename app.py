@@ -50,6 +50,7 @@ TARGET_NAMES = {
 # or a plain 'ecom_url'.
 OPTIONAL_FEEDS = [
     (("fn_ecom_url", "ecom_url"), "FN_Ecom_Sales_current.xlsx"),  # matches FN_Ecom_Sales_*.xlsx glob
+    (("fn_reviews_url", "reviews_url"), "Reviews_FN.xlsx"),        # Google Reviews master tracker (Raw_Reviews_Unique tab)
 ]
 
 
