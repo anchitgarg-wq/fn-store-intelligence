@@ -1956,11 +1956,15 @@ def _reviews_pick_sheet(path):
 
 def _reviews_build():
     import datetime as _rdt
-    try:
-        RFILE = _newest('Reviews_FN.xlsx', 'Reviews_FN.csv')
-    except FileNotFoundError:
+    # NB: do not use _newest() here - by this point in the module _g has been rebound from
+    # the glob alias to a DataFrame, so _newest (which reads _g) would raise. Glob directly.
+    import glob as _rglob, os as _ros
+    _rc = _rglob.glob(_ros.path.join(U, 'Reviews_FN.xlsx')) + \
+          _rglob.glob(_ros.path.join(U, 'Reviews_FN.csv'))
+    if not _rc:
         print('Reviews report not present (Reviews_FN.xlsx) - reviews tile will be absent.')
         return None
+    RFILE = max(_rc, key=_ros.path.getmtime)
     print('Using reviews:', os.path.basename(RFILE))
     sheet = _reviews_pick_sheet(RFILE)
     if sheet is None:
