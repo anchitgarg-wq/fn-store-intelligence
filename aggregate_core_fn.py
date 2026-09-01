@@ -1387,7 +1387,9 @@ try:
                 'fullprice':round2(fp*100 if fp is not None else None),
                 'gp':round2(gp*100 if gp is not None else None),
                 'upt':round2(upt),'aov':round2(aov),'asp':round2(asp)}
+    _kpi_failed_stores={}
     for loc, sub in kdf.groupby('Location'):
+      try:
         per={}
         for p in ['yesterday','wtd','mtd','ytd']:
             s,e=win(p); ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
@@ -1446,7 +1448,28 @@ try:
             per_lfl[p]={'ty':ty_l,'ly':ly_l,'comparable':True,
                         'lfl_window':{'ty':[str(ty_s),str(ty_e)],'ly':[str(ly_s),str(ly_e)]}}
         kpi_lfl_store[loc]=per_lfl
+      except Exception as _sx:
+        # One store's bad data used to abort the whole loop, leaving every store after it
+        # alphabetically with no KPI and every country blob null. Skip it and carry on.
+        import traceback as _tb
+        _kpi_failed_stores[loc]=repr(_sx)
+        print('!! KPI build failed for store %r: %r' % (loc, _sx))
+        for _ln in _tb.format_exc().splitlines()[-4:]:
+            print('!!   ' + _ln)
     print(f'KPI loaded for {len(kpi_store)} stores')
+    if _kpi_failed_stores:
+        print('!! %d store(s) skipped: %s' % (len(_kpi_failed_stores), sorted(_kpi_failed_stores)))
+    try:
+        _kpi_locs=set(kdf['Location'].dropna().unique())
+        _sales_locs=set(g['Location'].dropna().unique()) if 'Location' in g.columns else set()
+        print('KPI file covers %d locations; sales covers %d' % (len(_kpi_locs), len(_sales_locs)))
+        _only_sales=sorted(_sales_locs-_kpi_locs); _only_kpi=sorted(_kpi_locs-_sales_locs)
+        if _only_sales: print('!! in SALES but not KPI (%d): %s' % (len(_only_sales), _only_sales))
+        if _only_kpi:   print('!! in KPI but not SALES (%d): %s' % (len(_only_kpi), _only_kpi))
+        _kd=kdf['Date'].dt.date
+        print('KPI date range: %s .. %s | rows %d' % (_kd.min(), _kd.max(), len(kdf)))
+    except Exception as _cx:
+        print('KPI coverage diagnostic skipped:', repr(_cx))
 
     def _gp_combined(locs, salescol, costcol):
         sub=inv[inv['Location'].isin(locs)]
@@ -1544,7 +1567,13 @@ try:
             out[p]={'ty':ty,'ly':ly, **blob_extra}
         return out
 except Exception as ex:
-    print('KPI load skipped:', ex)
+    import traceback as _tb
+    print('!! KPI LOAD FAILED - every country KPI will be null and country_perf empty.')
+    print('!! reason:', repr(ex))
+    print('!! traceback:')
+    for _ln in _tb.format_exc().splitlines():
+        print('!!   ' + _ln)
+    print('!! kpi_store held %d stores when it failed: %s' % (len(kpi_store), sorted(kpi_store)))
     def combine_kpis(locs, lfl=False, all_countries=False): return None
 
 # ---------------- ECOM sales KPI (Forever New ecom report, dated) ----------------
@@ -1687,6 +1716,9 @@ for country, csub in g.groupby('Country'):
                   + xcat_item_rows(country=country)
     if kpi_store:
         clocs=[l for l in csub['Location'].unique() if l in kpi_store]
+        _miss=[l for l in csub['Location'].unique() if l not in kpi_store]
+        print('country %s: %d store(s) with KPI%s' % (country, len(clocs),
+              ('; %d without: %s' % (len(_miss), sorted(_miss))) if _miss else ''))
         blob['kpi']=combine_kpis(clocs)
         blob['kpi_lfl']=combine_kpis(clocs, lfl=True)   # like-for-like (comparable stores only)
     country_blobs[country]=blob
