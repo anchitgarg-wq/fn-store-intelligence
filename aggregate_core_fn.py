@@ -1250,6 +1250,9 @@ def inventory_snapshot(df, country=None):
 KPI_FILE = U+'04__Store_KPI__For_Live_Dashboard_-_Anchit_.xlsx'
 kpi_store = {}
 kpi_lfl_store = {}
+# Diagnostics travel in the payload as well as stdout: the service only surfaces the
+# last few stdout lines, so anything printed earlier is invisible from /status.
+KPI_DIAG = {}
 try:
     kdf = pd.read_excel(KPI_FILE, header=0)
     kdf.columns=[c.strip() for c in kdf.columns]
@@ -1388,6 +1391,7 @@ try:
                 'gp':round2(gp*100 if gp is not None else None),
                 'upt':round2(upt),'aov':round2(aov),'asp':round2(asp)}
     _kpi_failed_stores={}
+    KPI_DIAG['kpi_file_locations']=sorted(set(kdf['Location'].dropna().unique()))
     for loc, sub in kdf.groupby('Location'):
       try:
         per={}
@@ -1468,8 +1472,19 @@ try:
         if _only_kpi:   print('!! in KPI but not SALES (%d): %s' % (len(_only_kpi), _only_kpi))
         _kd=kdf['Date'].dt.date
         print('KPI date range: %s .. %s | rows %d' % (_kd.min(), _kd.max(), len(kdf)))
+        KPI_DIAG.update({'kpi_locations':len(_kpi_locs),'sales_locations':len(_sales_locs),
+                         'in_sales_not_kpi':_only_sales,'in_kpi_not_sales':_only_kpi,
+                         'kpi_date_min':str(_kd.min()),'kpi_date_max':str(_kd.max()),
+                         'kpi_rows':int(len(kdf)),'loaded_stores':sorted(kpi_store),
+                         'failed_stores':_kpi_failed_stores})
+        # per-store last KPI date, so a store absent for 'yesterday' is obvious
+        try:
+            _last=kdf.groupby('Location')['Date'].max().dt.date
+            KPI_DIAG['last_kpi_date_by_store']={k:str(v) for k,v in _last.items()}
+        except Exception: pass
     except Exception as _cx:
         print('KPI coverage diagnostic skipped:', repr(_cx))
+        KPI_DIAG['coverage_error']=repr(_cx)
 
     def _gp_combined(locs, salescol, costcol):
         sub=inv[inv['Location'].isin(locs)]
@@ -1574,6 +1589,8 @@ except Exception as ex:
     for _ln in _tb.format_exc().splitlines():
         print('!!   ' + _ln)
     print('!! kpi_store held %d stores when it failed: %s' % (len(kpi_store), sorted(kpi_store)))
+    KPI_DIAG.update({'fatal': repr(ex), 'traceback': _tb.format_exc().splitlines()[-6:],
+                     'loaded_stores': sorted(kpi_store)})
     def combine_kpis(locs, lfl=False, all_countries=False): return None
 
 # ---------------- ECOM sales KPI (Forever New ecom report, dated) ----------------
@@ -2094,7 +2111,8 @@ summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
                  'days_elapsed_month':DAYS_IN_MONTH,'days_elapsed_year':DAYS_IN_YEAR,
                  'generated':dt.datetime.now().isoformat(timespec='seconds'),
                  'periods':['yesterday','wtd','mtd','ytd'],
-                 'note_wtd':'WTD revenue is week-to-date; store rank still ranks WTD by units.'},
+                 'note_wtd':'WTD revenue is week-to-date; store rank still ranks WTD by units.',
+                 'kpi_diag':KPI_DIAG},
          'filters':filters,'country_rank':country_rank,'store_rank':store_rank,
          'store_country':store_country,
          'country_blobs':country_blobs,
