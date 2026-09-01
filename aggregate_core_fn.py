@@ -1247,6 +1247,7 @@ def inventory_snapshot(df, country=None):
 
 # ---------------- per-store summary ----------------
 # KPI source (daily, dated) — footfall/conversion/qty/full-price/UPT with LY comparison
+CLOSED_AFTER_DAYS = 3   # consecutive quiet days before a store counts as closed
 KPI_FILE = U+'04__Store_KPI__For_Live_Dashboard_-_Anchit_.xlsx'
 kpi_store = {}
 kpi_lfl_store = {}
@@ -1466,6 +1467,51 @@ try:
         for _ln in _tb.format_exc().splitlines()[-4:]:
             print('!!   ' + _ln)
     print(f'KPI loaded for {len(kpi_store)} stores')
+
+    # ---- closed-store rule (owner-defined, mirrors SM) --------------------------------
+    # Closed = no sales and no KPI row for CLOSED_AFTER_DAYS consecutive days, on a trailing
+    # window anchored to the freshest KPI day. Recomputed every run, so a store back from
+    # renovation clears itself with no list to maintain. Computed here, before the country
+    # roll-up, because the budget aggregation below depends on it.
+    try:
+        _cl_end = KPI_ASOF
+        _cl_start = KPI_ASOF - dt.timedelta(days=CLOSED_AFTER_DAYS - 1)
+        _cl = kdf[(kdf['Date'].dt.date >= _cl_start) & (kdf['Date'].dt.date <= _cl_end)].copy()
+        _cl = _cl[pd.to_numeric(_cl['Net Sales Amt'], errors='coerce').fillna(0) != 0]
+        # Stores that recorded a sale inside the window. Everything else is closed, and the
+        # test must be applied to the FULL store universe rather than to the KPI file's own
+        # store list: a store with NO KPI rows at all is the clearest case of the rule, and
+        # limiting the universe to the KPI file would silently exempt it.
+        TRADED_RECENT = set(_cl['Location'].dropna().unique())
+        _all_st = [l for l in kdf['Location'].dropna().unique()]
+        CLOSED_STORES = set(l for l in _all_st if l not in TRADED_RECENT)
+        _sold = kdf[pd.to_numeric(kdf['Net Sales Amt'], errors='coerce').fillna(0) != 0]
+        LAST_SALE = {l: d for l, d in _sold.groupby('Location')['Date'].max().dt.date.items()}
+        print('Closed stores in the KPI file (%s .. %s): %d -> %s' %
+              (_cl_start, _cl_end, len(CLOSED_STORES), sorted(CLOSED_STORES)))
+    except Exception as _clex:
+        print('Closed-store rule failed (treating every store as open):', _clex)
+        CLOSED_STORES = set(); TRADED_RECENT = set(); LAST_SALE = {}
+
+    def sum_budget_open(locs, s, e):
+        """Combined-view budget, clipped to each store's TRADING PERIOD.
+
+        An open store trades to the end of the window, so nothing is clipped. A store that
+        closed part-way contributes its target only up to the last day it recorded a sale -
+        measured on the days it traded, not against a target it could no longer deliver, and
+        not excused the days it was open. A store that never traded contributes nothing.
+        Actual sales are never clipped: a closed store's real trade stays in the totals."""
+        if isinstance(locs, str): locs = [locs]
+        tot = 0.0; found = False
+        for l in locs:
+            _last = LAST_SALE.get(l)
+            if _last is None: continue
+            _e = e if _last >= e else _last
+            if _e < s: continue
+            v = sum_budget(l, s, _e)
+            if v is not None:
+                tot += v; found = True
+        return tot if found else None
     if _kpi_failed_stores:
         print('!! %d store(s) skipped: %s' % (len(_kpi_failed_stores), sorted(_kpi_failed_stores)))
     try:
@@ -1579,7 +1625,7 @@ try:
             # GP% (both ty and ly) already set by agg_window from the KPI Cost Amt column.
             # Only the budget figures need to be added at the combined level.
             if ty is not None and not lfl:
-                _bt=sum_budget(locs,s,e)
+                _bt=sum_budget_open(locs,s,e)   # budget clipped to each store's trading period
                 ty['budget']=round2(_bt) if _bt else None
                 ty['budget_pct']=round2(ty['sales']/_bt*100) if (_bt and ty.get('sales') is not None) else None
                 _attach_kpi_targets(ty, sum_kpi_targets(locs, s, e))
@@ -1870,6 +1916,37 @@ store_rank={
 # store -> country lookup for the infographic
 store_country = g.groupby('Location')['Country'].first().to_dict()
 
+# ---- active store lists for the 'N stores combined' chip -------------------------------
+# Counts only stores currently trading, using the same CLOSED_STORES set the budget
+# aggregation uses, so the count, the labels and the budget can never disagree. Closed
+# stores keep contributing their actual sales to every total; only the COUNT changes.
+active_7d = {}
+store_activity = {}
+try:
+    # Full universe = every store the business has, not just those present in the KPI file.
+    _all_stores = sorted(set(store_country.keys()))
+    _closed = sorted(l for l in _all_stores if l not in TRADED_RECENT)
+    _active = sorted(l for l in _all_stores if l in TRADED_RECENT)
+    from collections import defaultdict as _dd7
+    _byc = _dd7(list)
+    for l in _active:
+        c = store_country.get(l)
+        if c: _byc[c].append(l)
+    active_7d = {c: sorted(s) for c, s in _byc.items()}
+    active_7d['All Countries'] = _active
+    store_activity = {
+        'rule': 'closed after %d consecutive days with no KPI row or no sales' % CLOSED_AFTER_DAYS,
+        'window': [str(KPI_ASOF - dt.timedelta(days=CLOSED_AFTER_DAYS - 1)), str(KPI_ASOF)],
+        'active': _active, 'closed': _closed,
+        'last_traded': {l: str(LAST_SALE.get(l)) for l in _all_stores if LAST_SALE.get(l)},
+    }
+    print('Store activity: %d active, %d closed' % (len(_active), len(_closed)))
+    for _c in _closed:
+        print('   closed: %s (last traded %s)' % (_c, LAST_SALE.get(_c, 'never')))
+except Exception as _saex:
+    print('Store activity build failed (chip falls back to period count):', _saex)
+    active_7d = {}; store_activity = {'error': repr(_saex)}
+
 # ---------------- filter trees ----------------
 geo = g[['Country','Region','Location']].drop_duplicates().sort_values(['Country','Region','Location'])
 filters={'countries':sorted(geo['Country'].unique().tolist()),
@@ -1914,7 +1991,7 @@ try:
         def _bud_series(locs):
             arr=[]
             for w in _weeks:
-                bs=sum_budget(locs, w['_mon'], w['_sun'])     # FN: single-budget 3-arg signature
+                bs=sum_budget_open(locs, w['_mon'], w['_sun'])  # FN: single-budget 3-arg signature
                 arr.append(round2(bs) if bs else None)
             return arr
         _all_locs=list(kdf['Location'].dropna().unique())
@@ -2119,6 +2196,7 @@ summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
                  'note_wtd':'WTD revenue is week-to-date; store rank still ranks WTD by units.',
                  'kpi_diag':KPI_DIAG},
          'filters':filters,'country_rank':country_rank,'store_rank':store_rank,
+         'active_7d':active_7d,'store_activity':store_activity,
          'store_country':store_country,
          'country_blobs':country_blobs,
          'country_perf':country_perf,
