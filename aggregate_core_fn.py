@@ -1406,9 +1406,14 @@ try:
                 _f = fp_yest.get(loc)
                 if _f and _f.get('amt_pct') is not None:
                     ty['fullprice']   = round2(_f['amt_pct']*100)    # by amount
-                    ty['fp_unit_pct'] = round2(_f['unit_pct']*100)   # by units
-                    ty['fp_units']    = _f['fp_units']
-                    ty['tot_units']   = _f['tot_units']
+                    # A returns-only day nets units to zero, so unit_pct is None. Guard each
+                    # multiplication rather than assuming both percentages exist: the store
+                    # still has a valid amount-based FP% and real sales to show.
+                    _up = _f.get('unit_pct')
+                    if _up is not None:
+                        ty['fp_unit_pct'] = round2(_up*100)          # by units
+                    ty['fp_units']    = _f.get('fp_units')
+                    ty['tot_units']   = _f.get('tot_units')
                     ty['fp_source']   = 'tag'
             # GP% now comes from agg_window (KPI file Cost Amt), computed for BOTH ty and ly,
             # so the vs-LY comparison works. No inventory-based override needed.
