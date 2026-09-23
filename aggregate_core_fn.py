@@ -2010,7 +2010,8 @@ try:
         weekly['weeks']=[{k:w[k] for k in ('iso','label','start','end')} for w in _weeks]
         def _series_for(sub):
             out={'sales_ty':[], 'sales_ly':[], 'sales_bud':[]}
-            for m in _METRICS: out[m]=[]
+            for m in _METRICS:
+                out[m]=[]; out[m+'_ly']=[]
             for w in _weeks:
                 s,e=w['_mon'],w['_sun']
                 ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
@@ -2018,7 +2019,58 @@ try:
                 out['sales_ty'].append(round2(ty['sales']) if ty else None)
                 out['sales_ly'].append(round2(ly['sales']) if ly else None)
                 for m in _METRICS:
+                    # LY was already computed for the sales line and thrown away. Keeping the
+                    # per-metric value costs nothing and guarantees the KPI trend's LY
+                    # reconciles with the Sales trend's - same window, same aggregation.
                     out[m].append((ty.get(m) if ty else None))
+                    out[m+'_ly'].append((ly.get(m) if ly else None))
+            return out
+
+        def _series_lfl(locs):
+            """Like-for-like weekly series.
+
+            FN's LFL is a DATE CLIP, not a store filter (SM flags LFL stores in the budget
+            tab; FN derives it from each store's opening date). So this mirrors combine_kpis:
+            a store counts for a week only if it was already open by the END of that week's
+            LY window, and both years are clipped to the span it actually traded - LY from
+            max(weekStart-1yr, open), TY the same span shifted forward a year.
+
+            Summing ratio metrics across stores is wrong, so each week is rebuilt from the
+            combined rows of the comparable cohort and the ratios derived once, exactly as
+            agg_window does for every other figure."""
+            out={'sales_ty':[], 'sales_ly':[], 'stores':[]}
+            for m in _METRICS:
+                out[m]=[]; out[m+'_ly']=[]
+            for w in _weeks:
+                s,e=w['_mon'],w['_sun']
+                ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
+                mem=[l for l in locs
+                     if (store_open.get(l) is not None and store_open[l] <= le)]
+                out['stores'].append(len(mem))
+                if not mem:
+                    out['sales_ty'].append(None); out['sales_ly'].append(None)
+                    for m in _METRICS: out[m].append(None); out[m+'_ly'].append(None)
+                    continue
+                ty_parts=[]; ly_parts=[]
+                for l in mem:
+                    op=store_open[l]
+                    ly_s=max(ls,op); ly_e=le
+                    ty_s=ly_s.replace(year=ly_s.year+1); ty_e=e
+                    sub_l=kdf[kdf['Location']==l]
+                    ty_parts.append(sub_l[(sub_l['Date'].dt.date>=ty_s)&(sub_l['Date'].dt.date<=ty_e)])
+                    ly_parts.append(sub_l[(sub_l['Date'].dt.date>=ly_s)&(sub_l['Date'].dt.date<=ly_e)])
+                def _agg(parts):
+                    if not parts: return None
+                    allrows=pd.concat(parts) if len(parts)>1 else parts[0]
+                    if allrows.empty: return None
+                    d0=allrows['Date'].dt.date.min(); d1=allrows['Date'].dt.date.max()
+                    return agg_window(allrows, d0, d1)
+                tyw=_agg(ty_parts); lyw=_agg(ly_parts)
+                out['sales_ty'].append(round2(tyw['sales']) if tyw else None)
+                out['sales_ly'].append(round2(lyw['sales']) if lyw else None)
+                for m in _METRICS:
+                    out[m].append((tyw.get(m) if tyw else None))
+                    out[m+'_ly'].append((lyw.get(m) if lyw else None))
             return out
         def _bud_series(locs):
             arr=[]
@@ -2028,16 +2080,19 @@ try:
             return arr
         _all_locs=list(kdf['Location'].dropna().unique())
         _a=_series_for(kdf); _a['sales_bud']=_bud_series(_all_locs)
+        _a['lfl']=_series_lfl(_all_locs)
         weekly['all']=_a
         for _cn in sorted(set(store_country.values())):
             _locs=[l for l in _all_locs if store_country.get(l)==_cn]
             if not _locs: continue
             _csub=kdf[kdf['Location'].isin(_locs)]
             _s=_series_for(_csub); _s['sales_bud']=_bud_series(_locs)
+            _s['lfl']=_series_lfl(_locs)
             weekly['country'][_cn]=_s
         for _loc in _all_locs:
             _ssub=kdf[kdf['Location']==_loc]
             _s=_series_for(_ssub); _s['sales_bud']=_bud_series([_loc])
+            _s['lfl']=_series_lfl([_loc])
             weekly['store'][_loc]=_s
     else:
         print('weekly trend skipped: no KPI data')
