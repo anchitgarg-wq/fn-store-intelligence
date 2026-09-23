@@ -876,7 +876,17 @@ def round2(x):
         return round(float(x),2)
     except: return None
 
-CURRENT_SEASON = 'SPRING 2026'
+CURRENT_SEASON = 'AUTUMN 2026'
+def _season_norm(s):
+    """Normalise an ERP season string for comparison.
+
+    Exact equality silently produced an empty current-season set whenever the feed's
+    spelling drifted - 'AUTUMN/2026', 'Autumn  2026' and 'autumn 2026' are the same
+    season and must all match."""
+    return ' '.join(str(s or '').upper().replace('/', ' ').replace('-', ' ').split())
+_CUR_SEASON_N = _season_norm(CURRENT_SEASON)
+def is_current_season(s):
+    return _season_norm(s).startswith(_CUR_SEASON_N)
 RECENT_DAYS = 30
 recent_cutoff = AS_OF - dt.timedelta(days=RECENT_DAYS)
 
@@ -906,7 +916,7 @@ def item_row(r, country=None):
     def asp(a,q): return round2(a/q) if q else None
     return {
         'key':r['Key'],'desc':name,'group':r['Group'],'dept':r['Dept'],'cls':r['Cls'],
-        'season':r['Season'],'cur_season':bool(r['Season']==CURRENT_SEASON),
+        'season':r['Season'],'cur_season':bool(is_current_season(r['Season'])),
         'gm':round2(gm),'fpmd':fpmd,'recent':recent,
         'inv_qty':round2(r['InvQty']),'stock_cost':round2(r['StockCost']),
         'img':r['Image'] if pd.notna(r['Image']) else None,
@@ -1084,14 +1094,34 @@ def in_transit(df):
 
 # ---------------- inventory snapshot (FP/MD mix, season mix, style counts, size avail) ----------------
 # Season bucketing: named current/recent seasons kept; everything else -> "Older".
-_SEASON_KEEP = [('SPRING 2026','Spring 2026'),('SUMMER 2026','Summer 2026'),
-                ('AUTUMN 2025','Autumn 2025'),('WINTER 2025','Winter 2025')]
+# Roll these forward each season. Autumn 2026 was absent, so every unit of the CURRENT
+# season was being bucketed as "Older" in the Inventory Snapshot - a visibly wrong number
+# with no error. The audit printed at build time now makes a missing bucket announce itself.
+_SEASON_KEEP = [('AUTUMN 2026','Autumn 2026'),('WINTER 2026','Winter 2026'),
+                ('SPRING 2026','Spring 2026'),('SUMMER 2026','Summer 2026')]
 def _season_bucket(s):
-    u=str(s).upper()
+    u=_season_norm(s)
     for k,lab in _SEASON_KEEP:
-        if k in u: return lab
+        if _season_norm(k) in u: return lab
     return 'Older'
-_SEASON_ORDER = ['Spring 2026','Summer 2026','Autumn 2025','Winter 2025','Older']
+_SEASON_ORDER = ['Autumn 2026','Winter 2026','Spring 2026','Summer 2026','Older']
+
+def _season_audit(series, where=''):
+    """Print what the season buckets actually caught. A season that stops matching is
+    otherwise invisible: the stock just moves quietly into 'Older'."""
+    try:
+        vals = [str(x) for x in series.dropna().unique()]
+        cur  = [v for v in vals if is_current_season(v)]
+        older= [v for v in vals if _season_bucket(v) == 'Older']
+        print('Season audit%s: CURRENT_SEASON=%r matched %d of %d distinct season values'
+              % (where, CURRENT_SEASON, len(cur), len(vals)))
+        if not cur:
+            print('!! CURRENT_SEASON matched NO rows - check the spelling in the feed.')
+            print('!! season values present: %s' % sorted(vals)[:25])
+        if older:
+            print('   bucketed as Older (%d): %s' % (len(older), sorted(older)[:15]))
+    except Exception as _sx:
+        print('Season audit skipped:', repr(_sx))
 
 # Size-set completeness threshold: a color code counts as a "full set" when it has at least
 # this many DISTINCT in-stock sizes; fewer (1..N-1) is "broken". Tune here if the apparel
@@ -1134,6 +1164,8 @@ def inventory_snapshot(df, country=None):
             _cc_tag_cache[cc] = fpmd_for(cc2fpmd_cty, cc, country, all_countries=_all_ctry)
         return _cc_tag_cache[cc]
     sub['_sb'] = sub['Season'].map(_season_bucket)
+    if not globals().get('_SEASON_AUDITED'):
+        _season_audit(sub['Season']); globals()['_SEASON_AUDITED']=True
     qcol = pd.to_numeric(sub['Inventory Qty'],errors='coerce').fillna(0)
     vcol = pd.to_numeric(sub['Inventory Value'],errors='coerce').fillna(0)
     sub['_q']=qcol; sub['_v']=vcol
