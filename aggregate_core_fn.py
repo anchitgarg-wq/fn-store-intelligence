@@ -28,7 +28,7 @@ Key business rules (locked with stakeholder):
         with zero sales, pick the zero-sellers with highest inventory COST.
   * Images attach at Key level; missing -> placeholder handled by frontend.
 """
-import pandas as pd, numpy as np, json, datetime as dt, warnings, sys, os
+import pandas as pd, numpy as np, json, datetime as dt, warnings, sys, os, calendar
 warnings.simplefilter('ignore')
 
 U = sys.argv[1] if len(sys.argv) > 1 else '/mnt/user-data/uploads/'
@@ -1325,11 +1325,111 @@ try:
     _kpi_dates = kdf['Date'].dt.date.dropna()
     KPI_ASOF = min(AS_OF, _kpi_dates.max()) if not _kpi_dates.empty else AS_OF
     print(f'KPI as-of (latest KPI date used): {KPI_ASOF}  (sales as-of {AS_OF})')
+    # agg_window filters by day on every call, for every store and period. Caching the day
+    # once as normalised datetime64 keeps those comparisons vectorised instead of rebuilding
+    # the column as Python date objects each time. (FN's budget/target lookups are plain
+    # dicts, so they need no equivalent.)
+    kdf['_d'] = kdf['Date'].dt.normalize()
+
+    # ---------------------------------------------------------------- selectable periods
+    # The four to-date periods answer "how are we doing now". They cannot answer "how did
+    # October go" or "compare W42 with W43", because a to-date window always ends today.
+    # So the KPI tiles also offer COMPLETE calendar weeks and months.
+    #
+    # Only complete periods are offered: a part-week sitting beside finished ones would look
+    # comparable and not be. The week containing KPI_ASOF is excluded unless KPI_ASOF is its
+    # Sunday, and the current month unless it is its last day. The range is discovered from
+    # the KPI file's own dates rather than assumed.
+    KPI_WEEKS_BACK = 13
+    KPI_MONTHS_BACK = 12
+    _kpi_min = min(_kpi_dates) if not _kpi_dates.empty else KPI_ASOF
+
+    def _complete_weeks(asof, n, floor):
+        """Last n complete Mon-Sun weeks ending at or before asof. -> [(key, s, e, label)]"""
+        out = []
+        monday = asof - dt.timedelta(days=asof.weekday())
+        e = asof if asof.weekday() == 6 else monday - dt.timedelta(days=1)
+        for _ in range(n):
+            st = e - dt.timedelta(days=6)
+            if st < floor:
+                break
+            iso = st.isocalendar()
+            out.append(('w:%04d-W%02d' % (iso[0], iso[1]), st, e,
+                        'W%02d (%s \u2013 %s)' % (iso[1], st.strftime('%-d %b'),
+                                                  e.strftime('%-d %b'))))
+            e = st - dt.timedelta(days=1)
+        return out
+
+    def _complete_months(asof, n, floor):
+        """Last n complete calendar months ending at or before asof."""
+        out = []
+        y, m = asof.year, asof.month
+        if asof.day != calendar.monthrange(y, m)[1]:      # current month unfinished
+            y, m = (y - 1, 12) if m == 1 else (y, m - 1)
+        for _ in range(n):
+            st = dt.date(y, m, 1)
+            if st < floor:
+                break
+            en = dt.date(y, m, calendar.monthrange(y, m)[1])
+            out.append(('m:%04d-%02d' % (y, m), st, en, st.strftime('%B %Y')))
+            y, m = (y - 1, 12) if m == 1 else (y, m - 1)
+        return out
+
+    # Deliberately defensive. A failure here would be caught by the outer handler, which
+    # nulls every country KPI and empties country_perf -- too high a price for adding a
+    # picker. The extra periods are optional by construction.
+    try:
+        _sel = _complete_weeks(KPI_ASOF, KPI_WEEKS_BACK, _kpi_min) \
+             + _complete_months(KPI_ASOF, KPI_MONTHS_BACK, _kpi_min)
+        KPI_WINDOWS = {k: (st, en) for k, st, en, _lab in _sel}
+        KPI_PERIOD_OPTIONS = {
+            'weeks':  [{'key': k, 'label': lab, 'from': st.isoformat(), 'to': en.isoformat()}
+                       for k, st, en, lab in _sel if k.startswith('w:')],
+            'months': [{'key': k, 'label': lab, 'from': st.isoformat(), 'to': en.isoformat()}
+                       for k, st, en, lab in _sel if k.startswith('m:')],
+        }
+        print('KPI selectable periods: %d weeks, %d months'
+              % (len(KPI_PERIOD_OPTIONS['weeks']), len(KPI_PERIOD_OPTIONS['months'])))
+    except Exception as _pex:
+        print('KPI week/month periods skipped (to-date periods unaffected):', _pex)
+        KPI_WINDOWS = {}
+        KPI_PERIOD_OPTIONS = {'weeks': [], 'months': []}
+    KPI_PERIODS = ['yesterday', 'wtd', 'mtd', 'ytd'] + list(KPI_WINDOWS)
+    # Only the last few stdout lines reach /status, so record it where it can be read.
+    KPI_DIAG['selectable_periods'] = {'weeks': len(KPI_PERIOD_OPTIONS['weeks']),
+                                      'months': len(KPI_PERIOD_OPTIONS['months'])}
+
     def win(period):
+        if period in KPI_WINDOWS: return KPI_WINDOWS[period]
         if period=='yesterday': return KPI_ASOF, KPI_ASOF
         if period=='wtd': return KPI_ASOF - dt.timedelta(days=KPI_ASOF.weekday()), KPI_ASOF
         if period=='mtd': return KPI_ASOF.replace(day=1), KPI_ASOF
         return KPI_ASOF.replace(month=1, day=1), KPI_ASOF
+
+    def _shift_year(d, back=1):
+        """Same calendar date a year earlier, surviving 29 February."""
+        try:
+            return d.replace(year=d.year - back)
+        except ValueError:
+            return d.replace(year=d.year - back, day=28)
+
+    def ly_win(period, s, e):
+        """The comparison window a year earlier.
+
+        A named WEEK is matched to the same ISO week number last year, not the same calendar
+        dates: shifting the dates lands mid-week, so W44 would be compared against a
+        Sunday-to-Saturday stretch, and the day-of-week mix drives footfall and conversion
+        more than anything else. Months and the to-date periods keep the calendar shift,
+        which is right for them.
+        """
+        if period.startswith('w:'):
+            iso = s.isocalendar()
+            try:
+                ls = dt.date.fromisocalendar(iso[0] - 1, iso[1], 1)
+                return ls, ls + dt.timedelta(days=6)
+            except ValueError:
+                pass            # week 53 with no counterpart last year
+        return _shift_year(s), _shift_year(e)
     def sum_budget(locs, s, e):
         """Sum daily Sales Target between s and e (inclusive) for a store or list of stores."""
         if isinstance(locs, str): locs=[locs]
@@ -1393,7 +1493,7 @@ try:
             if av is not None and tv:
                 ty[dst+'_pct'] = round2(av/tv*100)
     def agg_window(sub, s, e):
-        m = (sub['Date'].dt.date>=s) & (sub['Date'].dt.date<=e)
+        m = (sub['_d']>=pd.Timestamp(s)) & (sub['_d']<=pd.Timestamp(e))
         w = sub[m]
         if w.empty: return None
         sales=w['Net Sales Amt'].sum(); qty=w['Net Sales Qty'].sum(); foot=w['Footfall'].sum()
@@ -1428,8 +1528,8 @@ try:
     for loc, sub in kdf.groupby('Location'):
       try:
         per={}
-        for p in ['yesterday','wtd','mtd','ytd']:
-            s,e=win(p); ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
+        for p in KPI_PERIODS:
+            s,e=win(p); ls,le=ly_win(p,s,e)
             ty=agg_window(sub,s,e); ly=agg_window(sub,ls,le)
             # YESTERDAY FP from the authoritative master FP/MD tag (computed from the sales
             # file): FP Sales % = FP-tagged amount / total amount; plus FP unit % and counts
@@ -1469,8 +1569,8 @@ try:
         # shifted forward one year, so the two spans are equal length and directly comparable.
         per_lfl={}
         _open=store_open.get(loc)
-        for p in ['yesterday','wtd','mtd','ytd']:
-            s,e=win(p); ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
+        for p in KPI_PERIODS:
+            s,e=win(p); ls,le=ly_win(p,s,e)
             if _open is None:
                 # no opening date on record -> behave like the standard comparison
                 per_lfl[p]={'ty':per.get(p,{}).get('ty'),'ly':per.get(p,{}).get('ly'),'comparable':True}
@@ -1482,8 +1582,20 @@ try:
             # clip LY window to when the store was open; mirror the same span in TY
             ly_s = max(ls, _open)
             ly_e = le
-            # equal-length TY span ending at the period end (shift the clipped LY span +1yr)
-            ty_s = ly_s.replace(year=ly_s.year+1)
+            # Equal-length TY span ending at the period end. For the to-date periods the
+            # LY window is the TY window shifted back a year, so shifting the clipped start
+            # forward a year lands correctly. For a NAMED WEEK it does not: the LY window is
+            # the same ISO week last year, which is a different calendar date, so +1 year
+            # would land mid-week and the two spans would no longer describe the same days.
+            # Mirroring by day-offset from each window's own start is correct either way, and
+            # is used only for weeks so the existing periods keep their exact behaviour.
+            if p.startswith('w:'):
+                ty_s = s + dt.timedelta(days=(ly_s - ls).days)
+            else:
+                try:
+                    ty_s = ly_s.replace(year=ly_s.year+1)
+                except ValueError:          # 29 Feb has no counterpart next year
+                    ty_s = ly_s.replace(year=ly_s.year+1, day=28)
             ty_e = e
             ty_l = agg_window(sub, ty_s, ty_e)
             ly_l = agg_window(sub, ly_s, ly_e)
@@ -1584,8 +1696,8 @@ try:
         yesterday FP Sales % override below then reads the UAE-default tag columns instead
         of each sale's own real-country tag (every other view always uses the real tag)."""
         out={}
-        for p in ['yesterday','wtd','mtd','ytd']:
-            s,e=win(p); ls,le=s.replace(year=s.year-1), e.replace(year=e.year-1)
+        for p in KPI_PERIODS:
+            s,e=win(p); ls,le=ly_win(p,s,e)
             if not lfl:
                 csub = kdf[kdf['Location'].isin(locs)]
                 if csub.empty:
@@ -1674,6 +1786,10 @@ except Exception as ex:
     print('!! kpi_store held %d stores when it failed: %s' % (len(kpi_store), sorted(kpi_store)))
     KPI_DIAG.update({'fatal': repr(ex), 'traceback': _tb.format_exc().splitlines()[-6:],
                      'loaded_stores': sorted(kpi_store)})
+    # The page reads these to build its pickers; with no KPI data there is nothing to offer,
+    # and empty lists hide the control rather than breaking it.
+    KPI_PERIOD_OPTIONS = {'weeks': [], 'months': []}
+    KPI_PERIODS = ['yesterday', 'wtd', 'mtd', 'ytd']
     def combine_kpis(locs, lfl=False, all_countries=False): return None
 
 # ---------------- ECOM sales KPI (Forever New ecom report, dated) ----------------
@@ -2110,8 +2226,10 @@ def _abs_margin(d):
     s=d.get('sales'); gp=d.get('gp')
     if s is None or gp is None: return None
     return round2(s*gp/100.0)
+# Built from the kpi blobs, so it follows the KPI period selector rather than the global
+# one -- W44 tiles above an MTD country table would invite the wrong comparison.
 country_perf={}
-for _p in ['yesterday','wtd','mtd','ytd']:
+for _p in KPI_PERIODS:
     rows=[]
     for _cn, _blob in country_blobs.items():
         if _cn=='All Countries': continue
@@ -2280,6 +2398,9 @@ summary={'meta':{'as_of':AS_OF.isoformat(),'days_elapsed_week':DAYS_ELAPSED,
                  'days_elapsed_month':DAYS_IN_MONTH,'days_elapsed_year':DAYS_IN_YEAR,
                  'generated':dt.datetime.now().isoformat(timespec='seconds'),
                  'periods':['yesterday','wtd','mtd','ytd'],
+                 # Complete weeks/months the KPI tiles can switch to. The global 'periods'
+                 # above is unchanged: sales, stock and ecom still follow it.
+                 'kpi_periods':KPI_PERIOD_OPTIONS,
                  'note_wtd':'WTD revenue is week-to-date; store rank still ranks WTD by units.',
                  'kpi_diag':KPI_DIAG},
          'filters':filters,'country_rank':country_rank,'store_rank':store_rank,
