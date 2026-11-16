@@ -59,12 +59,40 @@ def norm_store(loc):
 
 # ---------------- barcode -> Color Code (FN's "key") ----------------
 # Forever New rolls up at COLOR CODE level (style-colour), the analogue of SM's NEW Key.
-# NOTE: FN_Color_Code_Master.xlsx (2026 format) has TWO header rows: row 1 is a merged
-# group label ('OG PRICE'/'CP'/'TAG' repeated over each country), row 2 has the real
-# column names ('Item Barcode', 'Color Code', ... 'UAE', 'KUWAIT', ...). header=1 skips
-# the group-label row so pandas reads the real names. Without this, pandas reads the
-# group-label row as headers and every column lookup below fails with a KeyError.
-key = pd.read_excel(U+'FN_Color_Code_Master.xlsx', dtype=str, header=1); key.columns=[c.strip() for c in key.columns]
+# FN_Color_Code_Master.xlsx (2026 format) has TWO header rows: row 1 is a merged group
+# label ('OG PRICE'/'CP'/'TAG' repeated over each country), row 2 has the real column
+# names ('Item Barcode', 'Color Code', ... 'UAE', 'KUWAIT', ...).
+#
+# This used to be hard-coded as header=1, with a comment warning that without it every
+# column lookup below fails with a KeyError. On 2026-11-16 it failed with exactly that
+# KeyError 21 seconds after the file was re-uploaded, while the file still had its two
+# header rows - so the row index had moved, not the format. A hard-coded index cannot
+# tell the difference between "the header is where I left it" and "the file gained a
+# blank row at the top", and neither can the person reading the traceback.
+#
+# So detect it, the way the ecom loader below already detects 'Order No'. The sheet is
+# searched for too: this read took sheet 0 by default while every other read of this
+# workbook names its sheet, so inserting a sheet at the front would silently feed the
+# wrong table into the barcode map rather than fail.
+_CCM = U + 'FN_Color_Code_Master.xlsx'
+def _find_header(path, want='Item Barcode', scan=12):
+    """Return (sheet_name, header_row) for the sheet whose first `scan` rows contain
+    `want`. Sheet 0 wins ties, so a workbook that has not moved reads as it always did."""
+    xl = pd.ExcelFile(path)
+    for sheet in xl.sheet_names:
+        probe = pd.read_excel(path, sheet_name=sheet, header=None, nrows=scan, dtype=str)
+        for i in range(len(probe)):
+            if (probe.iloc[i].astype(str).str.strip() == want).any():
+                return sheet, i
+    raise KeyError(
+        f"{os.path.basename(path)}: no sheet has a '{want}' header in its first {scan} rows "
+        f"(sheets: {', '.join(xl.sheet_names)}). The export's layout has changed - open it and "
+        f"check which row holds the column names."
+    )
+_ccm_sheet, _ccm_hrow = _find_header(_CCM)
+print('Color Code Master: sheet %r, header row %d' % (_ccm_sheet, _ccm_hrow))
+key = pd.read_excel(_CCM, dtype=str, sheet_name=_ccm_sheet, header=_ccm_hrow)
+key.columns=[str(c).strip() for c in key.columns]
 key['Item Barcode']=key['Item Barcode'].str.strip()
 b2k = key.dropna(subset=['Color Code']).drop_duplicates('Item Barcode').set_index('Item Barcode')['Color Code'].to_dict()
 
